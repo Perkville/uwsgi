@@ -4,7 +4,7 @@
 
 	jail systems (Linux namespaces, FreeBSD jails...) heavily rely on mount/umount
 
-	to simplify setups (expecially because the mount command could not be available in
+	to simplify setups (especially because the mount command could not be available in
 	the initial phase of jailing, we need an api to mount/umount filesystems
 
 	int uwsgi_mount(char *fs, char *what, char *where, int flags);
@@ -114,6 +114,8 @@ int uwsgi_mount(char *fs, char *what, char *where, char *flags, char *data) {
 	char *mflags = uwsgi_str(flags);
 	char *p, *ctx = NULL;
 	uwsgi_foreach_token(mflags, ",", p, ctx) {
+		if (strcmp(p, "defaults") == 0)
+			continue;
 		unsigned long flag = (unsigned long) uwsgi_mount_flag(p);
 		if (!flag) {
 			uwsgi_log("unknown mount flag \"%s\"\n", p);
@@ -121,6 +123,7 @@ int uwsgi_mount(char *fs, char *what, char *where, char *flags, char *data) {
 		}
 		mountflags |= flag;
 	}
+	if (!*fs) fs = NULL;
 	free(mflags);
 parsed:
 #ifdef __linux__

@@ -2,6 +2,33 @@
 
 extern struct uwsgi_server uwsgi;
 
+static void master_check_processes() {
+
+	// run the function, only if required
+	if (!uwsgi.die_on_no_workers) return;
+
+	int alive_processes = 0;
+	int dead_processes = 0;
+
+	int i;
+	for (i = 1; i <= uwsgi.numproc; i++) {
+		if (uwsgi.workers[i].cheaped == 0 && uwsgi.workers[i].pid > 0) {
+			alive_processes++;
+		}
+		else {
+			dead_processes++;
+		}
+	}
+
+	if (uwsgi.die_on_no_workers) {
+		if (!alive_processes) {
+			uwsgi_log_verbose("no more processes running, auto-killing ...\n");
+			exit(1);
+			// never here;
+		}
+	}
+}
+
 void uwsgi_update_load_counters() {
 
 	int i;
@@ -140,7 +167,7 @@ void uwsgi_master_check_mercy() {
 		if (uwsgi.workers[i].pid > 0 && uwsgi.workers[i].cursed_at) {
 			if (uwsgi_now() > uwsgi.workers[i].no_mercy_at) {
 				uwsgi_log_verbose("worker %d (pid: %d) is taking too much time to die...NO MERCY !!!\n", i, uwsgi.workers[i].pid);
-				// yes that look strangem but we avoid callign it again if we skip waitpid() call below
+				// yes that looks strange but we avoid calling it again if we skip waitpid() call below
 				uwsgi_curse(i, SIGKILL);
 			}
 		}
@@ -152,6 +179,15 @@ void uwsgi_master_check_mercy() {
 				uwsgi_log_verbose("mule %d (pid: %d) is taking too much time to die...NO MERCY !!!\n", i + 1, uwsgi.mules[i].pid);
 				uwsgi_curse_mule(i, SIGKILL);
 			}
+		}
+	}
+
+
+	struct uwsgi_spooler *us;
+	for (us = uwsgi.spoolers; us; us = us->next) {
+		if (us->pid > 0 && us->cursed_at && uwsgi_now() > us->no_mercy_at) {
+				uwsgi_log_verbose("spooler %d (pid: %d) is taking too much time to die...NO MERCY !!!\n", i + 1, us->pid);
+				kill(us->pid, SIGKILL);
 		}
 	}
 }
@@ -258,17 +294,18 @@ static void master_check_listen_queue() {
 		if (uwsgi_sock->queue > backlog) {
 			backlog = uwsgi_sock->queue;
 		}
+
 		if (uwsgi_sock->queue > 0 && uwsgi_sock->queue >= uwsgi_sock->max_queue) {
 			uwsgi_log_verbose("*** uWSGI listen queue of socket \"%s\" (fd: %d) full !!! (%llu/%llu) ***\n", uwsgi_sock->name, uwsgi_sock->fd, (unsigned long long) uwsgi_sock->queue, (unsigned long long) uwsgi_sock->max_queue);
-		}
 
-		if (uwsgi.alarm_backlog) {
-			char buf[1024];
-			int ret = snprintf(buf, 1024, "listen queue of socket \"%s\" (fd: %d) full !!! (%llu/%llu)", uwsgi_sock->name, uwsgi_sock->fd, (unsigned long long) uwsgi_sock->queue, (unsigned long long) uwsgi_sock->max_queue);
-			if (ret > 0 && ret < 1024) {
-				struct uwsgi_string_list *usl = NULL;
-				uwsgi_foreach(usl, uwsgi.alarm_backlog) {
-					uwsgi_alarm_trigger(usl->value, buf, ret);
+			if (uwsgi.alarm_backlog) {
+				char buf[1024];
+				int ret = snprintf(buf, 1024, "listen queue of socket \"%s\" (fd: %d) full !!! (%llu/%llu)", uwsgi_sock->name, uwsgi_sock->fd, (unsigned long long) uwsgi_sock->queue, (unsigned long long) uwsgi_sock->max_queue);
+				if (ret > 0 && ret < 1024) {
+					struct uwsgi_string_list *usl = NULL;
+					uwsgi_foreach(usl, uwsgi.alarm_backlog) {
+						uwsgi_alarm_trigger(usl->value, buf, ret);
+					}
 				}
 			}
 		}
@@ -333,14 +370,10 @@ int master_loop(char **argv, char **environ) {
 
 	uwsgi_unix_signal(SIGTSTP, suspend_resume_them_all);
 	uwsgi_unix_signal(SIGHUP, grace_them_all);
-	if (uwsgi.die_on_term) {
-		uwsgi_unix_signal(SIGTERM, kill_them_all);
-		uwsgi_unix_signal(SIGQUIT, reap_them_all);
-	}
-	else {
-		uwsgi_unix_signal(SIGTERM, reap_them_all);
-		uwsgi_unix_signal(SIGQUIT, kill_them_all);
-	}
+
+	uwsgi_unix_signal(SIGTERM, kill_them_all);
+	uwsgi_unix_signal(SIGQUIT, reap_them_all);
+
 	uwsgi_unix_signal(SIGINT, kill_them_all);
 	uwsgi_unix_signal(SIGUSR1, stats);
 
@@ -626,7 +659,7 @@ int master_loop(char **argv, char **environ) {
 
 		// check for death (before reload !!!)
 		uwsgi_master_check_death();
-		// check for realod
+		// check for reload
 		if (uwsgi_master_check_reload(argv)) {
 			return -1;
 		}
@@ -644,6 +677,13 @@ int master_loop(char **argv, char **environ) {
 		if (uwsgi.cheaper && !uwsgi.status.is_cheap && !uwsgi_instance_is_reloading && !uwsgi_instance_is_dying && !uwsgi.workers[0].suspended) {
 			if (!uwsgi_calc_cheaper())
 				return 0;
+		}
+
+		// spooler cheap management
+		if (uwsgi.spooler_cheap) {
+			if ((uwsgi.master_cycles % uwsgi.spooler_frequency) == 0) {
+				uwsgi_spooler_cheap_check();
+			}
 		}
 
 
@@ -689,7 +729,7 @@ int master_loop(char **argv, char **environ) {
 			// locking is not needed as timers can only increase
 			for (i = 0; i < ushared->timers_cnt; i++) {
 				if (!ushared->timers[i].registered) {
-					ushared->timers[i].fd = event_queue_add_timer(uwsgi.master_queue, &ushared->timers[i].id, ushared->timers[i].value);
+					ushared->timers[i].fd = event_queue_add_timer_hr(uwsgi.master_queue, &ushared->timers[i].id, ushared->timers[i].value, ushared->timers[i].nsvalue);
 					ushared->timers[i].registered = 1;
 				}
 			}
@@ -730,6 +770,8 @@ int master_loop(char **argv, char **environ) {
 
 			// update load counter
 			uwsgi_update_load_counters();
+
+			master_check_processes();
 
 
 			// check uwsgi-cron table
@@ -828,6 +870,18 @@ int master_loop(char **argv, char **environ) {
 					uwsgi_reload_workers();
 					continue;
 				}
+				touched = uwsgi_check_touches(uwsgi.touch_mules_reload);
+				if (touched) {
+					uwsgi_log_verbose("*** %s has been touched... mules reload !!! ***\n", touched);
+					uwsgi_reload_mules();
+					continue;
+				}
+				touched = uwsgi_check_touches(uwsgi.touch_spoolers_reload);
+				if (touched) {
+					uwsgi_log_verbose("*** %s has been touched... spoolers reload !!! ***\n", touched);
+					uwsgi_reload_spoolers();
+					continue;
+				}
 				touched = uwsgi_check_touches(uwsgi.touch_chain_reload);
 				if (touched) {
 					if (uwsgi.status.chain_reloading == 0) {
@@ -861,7 +915,10 @@ int master_loop(char **argv, char **environ) {
 						if (touched) {
 							uwsgi_log_verbose("*** %s has been touched... reloading daemon \"%s\" (pid: %d) !!! ***\n", touched, ud->command, (int) ud->pid);
 							if (kill(-ud->pid, ud->stop_signal)) {
-								uwsgi_error("[uwsgi-daemon/touch] kill()");
+								// killing process group failed, try to kill by process id
+								if (kill(ud->pid, ud->stop_signal)) {
+									uwsgi_error("[uwsgi-daemon/touch] kill()");
+								}
 							}
 						}
                 			}
@@ -964,7 +1021,24 @@ next:
 		// ok a worker died...
 		uwsgi.workers[thewid].pid = 0;
 		// only to be safe :P
-		uwsgi.workers[thewid].harakiri = 0;
+		for(i=0;i<uwsgi.cores;i++) {
+			uwsgi.workers[thewid].cores[i].harakiri = 0;
+		}
+
+
+		// first check failed app loading in need-app mode
+		if (WIFEXITED(waitpid_status) && WEXITSTATUS(waitpid_status) == UWSGI_FAILED_APP_CODE) {
+			if (uwsgi.lazy_apps && uwsgi.need_app) {
+				uwsgi_log("OOPS ! failed loading app in worker %d (pid %d)\n", thewid, (int) diedpid);
+				uwsgi_log_verbose("need-app requested, destroying the instance...\n");
+				uwsgi.status.dying_for_need_app = 1;
+				kill_them_all(0);
+				continue;
+			}
+			else {
+				uwsgi_log("OOPS ! failed loading app in worker %d (pid %d) :( trying again...\n", thewid, (int) diedpid);
+			}
+		}
 
 		// ok, if we are reloading or dying, just continue the master loop
 		// as soon as all of the workers have pid == 0, the action (exit, or reload) is triggered
@@ -973,20 +1047,11 @@ next:
 				uwsgi.workers[thewid].cursed_at = uwsgi_now();
 			uwsgi_log("worker %d buried after %d seconds\n", thewid, (int) (uwsgi_now() - uwsgi.workers[thewid].cursed_at));
 			uwsgi.workers[thewid].cursed_at = 0;
+			// if we are stopping workers, just end here
 			continue;
 		}
 
-		// if we are stopping workers, just end here
-
-		if (WIFEXITED(waitpid_status) && WEXITSTATUS(waitpid_status) == UWSGI_FAILED_APP_CODE) {
-			uwsgi_log("OOPS ! failed loading app in worker %d (pid %d) :( trying again...\n", thewid, (int) diedpid);
-			if (uwsgi.lazy_apps && uwsgi.need_app) {
-				uwsgi_log_verbose("need-app requested, destroying the instance...\n");
-				kill_them_all(0);
-				continue;
-			}
-		}
-		else if (WIFEXITED(waitpid_status) && WEXITSTATUS(waitpid_status) == UWSGI_DE_HIJACKED_CODE) {
+		if (WIFEXITED(waitpid_status) && WEXITSTATUS(waitpid_status) == UWSGI_DE_HIJACKED_CODE) {
 			uwsgi_log("...restoring worker %d (pid: %d)...\n", thewid, (int) diedpid);
 		}
 		else if (WIFEXITED(waitpid_status) && WEXITSTATUS(waitpid_status) == UWSGI_EXCEPTION_CODE) {
@@ -1017,7 +1082,7 @@ next:
 		}
 		// manage_next_request is zero, but killed by signal...
 		else if (WIFSIGNALED(waitpid_status)) {
-			uwsgi_log("DAMN ! worker %d (pid: %d) MISTERIOUSLY killed by signal %d :( trying respawn ...\n", thewid, (int) diedpid, (int) WTERMSIG(waitpid_status));
+			uwsgi_log("DAMN ! worker %d (pid: %d) MYSTERIOUSLY killed by signal %d :( trying respawn ...\n", thewid, (int) diedpid, (int) WTERMSIG(waitpid_status));
 		}
 
 		if (uwsgi.workers[thewid].cheaped == 1) {
@@ -1065,6 +1130,32 @@ void uwsgi_reload_workers() {
 	for (i = 1; i <= uwsgi.numproc; i++) {
 		if (uwsgi.workers[i].pid > 0) {
 			uwsgi_curse(i, SIGHUP);
+		}
+	}
+	uwsgi_unblock_signal(SIGHUP);
+}
+
+void uwsgi_reload_mules() {
+	int i;
+
+	uwsgi_block_signal(SIGHUP);
+	for (i = 0; i <= uwsgi.mules_cnt; i++) {
+		if (uwsgi.mules[i].pid > 0) {
+			uwsgi_curse_mule(i, SIGHUP);
+		}
+	}
+	uwsgi_unblock_signal(SIGHUP);
+}
+
+void uwsgi_reload_spoolers() {
+	struct uwsgi_spooler *us;
+
+	uwsgi_block_signal(SIGHUP);
+	for (us = uwsgi.spoolers; us; us = us->next) {
+		if (us->pid > 0) {
+			kill(us->pid, SIGHUP);
+			us->cursed_at = uwsgi_now();
+			us->no_mercy_at = us->cursed_at + uwsgi.spooler_reload_mercy;
 		}
 	}
 	uwsgi_unblock_signal(SIGHUP);

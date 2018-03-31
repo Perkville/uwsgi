@@ -5,14 +5,15 @@ The uWSGI Emperor
 */
 #include <uwsgi.h>
 
-
 extern struct uwsgi_server uwsgi;
 extern char **environ;
 
-void emperor_send_stats(int);
+static void emperor_send_stats(int);
+static void emperor_manage_command(int);
 
 time_t emperor_throttle;
 int emperor_throttle_level;
+int emperor_warming_up = 1;
 
 struct uwsgi_instance *ui;
 
@@ -36,6 +37,142 @@ struct uwsgi_emperor_blacklist_item {
 };
 
 struct uwsgi_emperor_blacklist_item *emperor_blacklist;
+
+char *vassal_attr_get(struct uwsgi_instance *c_ui, char *attr) {
+	if (!attr) return NULL;
+	struct uwsgi_dyn_dict *attrs = c_ui->attrs;
+	while(attrs) {
+		if (!strcmp(attrs->key, attr)) {
+			return attrs->value;
+		}
+		attrs = attrs->next;
+	}
+	return NULL;
+}
+
+int vassal_attr_get_multi(struct uwsgi_instance *c_ui, char *attr, int (*func)(struct uwsgi_instance *, char *, void *), void *data) {
+	if (!attr) return -1;
+        struct uwsgi_dyn_dict *attrs = c_ui->attrs;
+        while(attrs) {
+                if (!strcmp(attrs->key, attr)) {
+			if (func(c_ui, attrs->value, data)) {
+				return -1;
+			}
+                }
+                attrs = attrs->next;
+        }
+        return 0;
+}
+
+// this generates the argv for the new vassal
+static char **vassal_new_argv(struct uwsgi_instance *n_ui, int *slot_to_free) {
+
+	int counter = 4;
+	struct uwsgi_string_list *uct;
+	uwsgi_foreach(uct, uwsgi.vassals_templates_before) counter += 2;
+	uwsgi_foreach(uct, uwsgi.vassals_includes_before) counter += 2;
+	uwsgi_foreach(uct, uwsgi.vassals_set) counter += 2;
+	uwsgi_foreach(uct, uwsgi.vassals_templates) counter += 2;
+	uwsgi_foreach(uct, uwsgi.vassals_includes) counter += 2;
+
+	char **vassal_argv = uwsgi_malloc(sizeof(char *) * counter);
+	// set args
+	vassal_argv[0] = uwsgi.emperor_wrapper ? uwsgi.emperor_wrapper : uwsgi.binary_path;
+	char *wrapper_attr = vassal_attr_get(n_ui, uwsgi.emperor_wrapper_attr);
+	if (wrapper_attr) vassal_argv[0] = wrapper_attr;
+
+	// reset counter
+	counter = 1;
+
+	uwsgi_foreach(uct, uwsgi.vassals_templates_before) {
+		vassal_argv[counter] = "--inherit";
+		vassal_argv[counter + 1] = uct->value;
+		counter += 2;
+	}
+
+	uwsgi_foreach(uct, uwsgi.vassals_includes_before) {
+		vassal_argv[counter] = "--include";
+		vassal_argv[counter + 1] = uct->value;
+		counter += 2;
+	}
+
+	uwsgi_foreach(uct, uwsgi.vassals_set) {
+		vassal_argv[counter] = "--set";
+		vassal_argv[counter + 1] = uct->value;
+		counter += 2;
+	}
+
+	char *colon = NULL;
+	if (uwsgi.emperor_broodlord) {
+		colon = strchr(n_ui->name, ':');
+		if (colon) {
+			colon[0] = 0;
+		}
+	}
+	// initialize to a default value
+	vassal_argv[counter] = "--inherit";
+
+	if (!strcmp(n_ui->name + (strlen(n_ui->name) - 4), ".xml"))
+		vassal_argv[counter] = "--xml";
+	if (!strcmp(n_ui->name + (strlen(n_ui->name) - 4), ".ini"))
+		vassal_argv[counter] = "--ini";
+	if (!strcmp(n_ui->name + (strlen(n_ui->name) - 4), ".yml"))
+		vassal_argv[counter] = "--yaml";
+	if (!strcmp(n_ui->name + (strlen(n_ui->name) - 5), ".yaml"))
+		vassal_argv[counter] = "--yaml";
+	if (!strcmp(n_ui->name + (strlen(n_ui->name) - 3), ".js"))
+		vassal_argv[counter] = "--json";
+	if (!strcmp(n_ui->name + (strlen(n_ui->name) - 5), ".json"))
+		vassal_argv[counter] = "--json";
+	struct uwsgi_string_list *usl = uwsgi.emperor_extra_extension;
+	while (usl) {
+		if (uwsgi_endswith(n_ui->name, usl->value)) {
+			vassal_argv[counter] = "--config";
+			break;
+		}
+		usl = usl->next;
+	}
+	if (colon)
+		colon[0] = ':';
+
+	// start config filename...
+	counter++;
+
+	vassal_argv[counter] = n_ui->name;
+	if (uwsgi.emperor_magic_exec) {
+		if (!access(n_ui->name, R_OK | X_OK)) {
+			vassal_argv[counter] = uwsgi_concat2("exec://", n_ui->name);
+			if (slot_to_free)
+				*slot_to_free = counter;
+		}
+
+	}
+	else if (n_ui->use_config) {
+		vassal_argv[counter] = uwsgi_concat2("emperor://", n_ui->name);
+		if (slot_to_free)
+			*slot_to_free = counter;
+	}
+
+	// start templates,includes,inherit...
+	counter++;
+
+	uwsgi_foreach(uct, uwsgi.vassals_templates) {
+		vassal_argv[counter] = "--inherit";
+		vassal_argv[counter + 1] = uct->value;
+		counter += 2;
+	}
+
+	uwsgi_foreach(uct, uwsgi.vassals_includes) {
+		vassal_argv[counter] = "--include";
+		vassal_argv[counter + 1] = uct->value;
+		counter += 2;
+	}
+
+	vassal_argv[counter] = NULL;
+
+	return vassal_argv;
+}
+
 
 /*
 this should be placed in core/socket.c but we realized it was needed
@@ -116,7 +253,7 @@ struct uwsgi_emperor_blacklist_item *uwsgi_emperor_blacklist_check(char *id) {
 
 void uwsgi_emperor_blacklist_add(char *id) {
 
-	// check if the item is already in the blacklist        
+	// check if the item is already in the blacklist
 	struct uwsgi_emperor_blacklist_item *uebi = uwsgi_emperor_blacklist_check(id);
 	if (uebi) {
 		gettimeofday(&uebi->last_attempt, NULL);
@@ -153,6 +290,7 @@ void uwsgi_emperor_blacklist_add(char *id) {
 	}
 
 	strncpy(uebi->id, id, 0xff);
+	uebi->id[0xff-1] = '\0';
 	gettimeofday(&uebi->first_attempt, NULL);
 	memcpy(&uebi->last_attempt, &uebi->first_attempt, sizeof(struct timeval));
 	uebi->throttle_level = uwsgi.emperor_throttle;
@@ -211,7 +349,7 @@ int uwsgi_emperor_is_valid(char *name) {
 	return 0;
 }
 
-static char *emperor_check_on_demand_socket(char *filename) {
+static char *emperor_check_on_demand_socket(char *filename, struct uwsgi_dyn_dict *attrs) {
 	size_t len = 0;
 	if (uwsgi.emperor_on_demand_extension) {
 		char *tmp = uwsgi_concat2(filename, uwsgi.emperor_on_demand_extension);
@@ -253,7 +391,7 @@ static char *emperor_check_on_demand_socket(char *filename) {
 	else if (uwsgi.emperor_on_demand_exec) {
 		int cpipe[2];
 		if (pipe(cpipe)) {
-			uwsgi_error("emperor_check_on_demand_socket()pipe()");
+			uwsgi_error("emperor_check_on_demand_socket()/pipe()");
 			return NULL;
 		}
 		char *cmd = uwsgi_concat4(uwsgi.emperor_on_demand_exec, " \"", filename, "\"");
@@ -344,12 +482,41 @@ void uwsgi_imperial_monitor_directory(struct uwsgi_emperor_scanner *ues) {
 			}
 			// check if mtime is changed and the uWSGI instance must be reloaded
 			if (st.st_mtime > ui_current->last_mod) {
+				if (uwsgi.emperor_force_config_pipe) {
+					char *config = uwsgi_simple_file_read(de->d_name);
+					if (!config) {
+						uwsgi_log_verbose("[emperor] unable to read %s\n", de->d_name);
+						emperor_stop(ui_current);
+                                        	continue;
+					}
+					if (ui_current->config)
+                                        	free(ui_current->config);
+                                	ui_current->config = config;
+                                	ui_current->config_len = strlen(ui_current->config);
+				}
 				emperor_respawn(ui_current, st.st_mtime);
 			}
 		}
 		else {
-			char *socket_name = emperor_check_on_demand_socket(de->d_name);
-			emperor_add(ues, de->d_name, st.st_mtime, NULL, 0, t_uid, t_gid, socket_name);
+			struct uwsgi_dyn_dict *attrs = NULL;
+			if (uwsgi.emperor_collect_attributes) {
+				if (uwsgi_endswith(de->d_name, ".ini")) {
+					uwsgi_emperor_ini_attrs(de->d_name, NULL, &attrs);
+				}
+			}
+			char *socket_name = emperor_check_on_demand_socket(de->d_name, attrs);
+			if (uwsgi.emperor_force_config_pipe) {
+				char *config = uwsgi_simple_file_read(de->d_name);
+				if (config) {
+					emperor_add_with_attrs(ues, de->d_name, st.st_mtime, config, strlen(config), t_uid, t_gid, socket_name, attrs);
+				}
+				else {
+					uwsgi_log_verbose("[emperor] unable to read %s\n", de->d_name);
+				}
+			}
+			else {
+				emperor_add_with_attrs(ues, de->d_name, st.st_mtime, NULL, 0, t_uid, t_gid, socket_name, attrs);
+			}
 			if (socket_name)
 				free(socket_name);
 		}
@@ -465,14 +632,43 @@ void uwsgi_imperial_monitor_glob(struct uwsgi_emperor_scanner *ues) {
 			}
 			// check if mtime is changed and the uWSGI instance must be reloaded
 			if (st.st_mtime > ui_current->last_mod) {
+				if (uwsgi.emperor_force_config_pipe) {
+                                        char *config = uwsgi_simple_file_read(g.gl_pathv[i]);
+                                        if (!config) {
+                                                uwsgi_log_verbose("[emperor] unable to read %s\n", g.gl_pathv[i]);
+                                                emperor_stop(ui_current);
+                                                continue;
+                                        }
+                                        if (ui_current->config)
+                                                free(ui_current->config);
+                                        ui_current->config = config;
+                                        ui_current->config_len = strlen(ui_current->config);
+                                }
 				emperor_respawn(ui_current, st.st_mtime);
 			}
 		}
 		else {
-			char *socket_name = emperor_check_on_demand_socket(g.gl_pathv[i]);
-			emperor_add(ues, g.gl_pathv[i], st.st_mtime, NULL, 0, t_uid, t_gid, socket_name);
-			if (socket_name)
-				free(socket_name);
+			struct uwsgi_dyn_dict *attrs = NULL;
+                        if (uwsgi.emperor_collect_attributes) {
+                                if (uwsgi_endswith(g.gl_pathv[i], ".ini")) {
+                                        uwsgi_emperor_ini_attrs(g.gl_pathv[i], NULL, &attrs);
+                                }
+                        }
+                        char *socket_name = emperor_check_on_demand_socket(g.gl_pathv[i], attrs);
+			if (uwsgi.emperor_force_config_pipe) {
+                                char *config = uwsgi_simple_file_read(g.gl_pathv[i]);
+                                if (config) {
+                                        emperor_add_with_attrs(ues, g.gl_pathv[i], st.st_mtime, config, strlen(config), t_uid, t_gid, socket_name, attrs);
+                                }
+                                else {
+                                        uwsgi_log_verbose("[emperor] unable to read %s\n", g.gl_pathv[i]);
+                                }
+                        }
+                        else {
+                                emperor_add_with_attrs(ues, g.gl_pathv[i], st.st_mtime, NULL, 0, t_uid, t_gid, socket_name, attrs);
+                        }	
+                        if (socket_name)
+                                free(socket_name);
 		}
 
 	}
@@ -597,7 +793,7 @@ static void emperor_massive_reload(int signum) {
 }
 
 
-static void emperor_stats() {
+static void emperor_stats(int signum) {
 
 	struct uwsgi_instance *c_ui = ui->ui_next;
 
@@ -666,16 +862,12 @@ void emperor_del(struct uwsgi_instance *c_ui) {
 	}
 
 	// this will destroy the whole uWSGI instance (and workers)
-	if (c_ui->pipe[0] != -1)
-		close(c_ui->pipe[0]);
-	if (c_ui->pipe[1] != -1)
-		close(c_ui->pipe[1]);
+	if (c_ui->pipe[0] != -1) close(c_ui->pipe[0]);
+	if (c_ui->pipe[1] != -1) close(c_ui->pipe[1]);
 
 	if (c_ui->use_config) {
-		if (c_ui->pipe_config[0] != -1)
-			close(c_ui->pipe_config[0]);
-		if (c_ui->pipe_config[1] != -1)
-			close(c_ui->pipe_config[1]);
+		if (c_ui->pipe_config[0] != -1) close(c_ui->pipe_config[0]);
+		if (c_ui->pipe_config[1] != -1) close(c_ui->pipe_config[1]);
 	}
 
 	if (uwsgi.vassals_stop_hook) {
@@ -703,15 +895,20 @@ void emperor_del(struct uwsgi_instance *c_ui) {
 		free(c_ui->socket_name);
 	}
 
-	if (c_ui->config)
-		free(c_ui->config);
-
 	if (c_ui->on_demand_fd > -1) {
 		close(c_ui->on_demand_fd);
 	}
+	if (c_ui->config) free(c_ui->config);
+
+	struct uwsgi_dyn_dict *attr = c_ui->attrs;
+        while(attr) {
+        	struct uwsgi_dyn_dict *tmp = attr;
+                attr = attr->next;
+		if (tmp->value) free(tmp->value);
+                free(tmp);
+        }
 
 	free(c_ui);
-
 }
 
 void emperor_back_to_ondemand(struct uwsgi_instance *c_ui) {
@@ -736,6 +933,12 @@ void emperor_stop(struct uwsgi_instance *c_ui) {
 	if (c_ui->status == 1)
 		return;
 	// remove uWSGI instance
+
+	// in Zeus mode we need to send
+	// the DESTROY message to all of the nodes
+	if (uwsgi.zeus) {
+		return;
+	}
 
 	if (c_ui->pid != -1) {
 		if (write(c_ui->pipe[0], "\0", 1) != 1) {
@@ -769,7 +972,7 @@ static void emperor_push_config(struct uwsgi_instance *c_ui) {
 
 	if (c_ui->use_config) {
 		uh.modifier1 = 115;
-		uh.pktsize = c_ui->config_len;
+		uh._pktsize = c_ui->config_len;
 		uh.modifier2 = 0;
 		if (write(c_ui->pipe_config[0], &uh, 4) != 4) {
 			uwsgi_error("[uwsgi-emperor] write() header config");
@@ -788,6 +991,17 @@ void emperor_respawn(struct uwsgi_instance *c_ui, time_t mod) {
 	if (c_ui->status > 0)
 		return;
 
+	// if in Zeus mode, we need to send
+	// the reload message to all of the nodes
+	if (uwsgi.zeus) {
+		return;
+	}
+
+	// check if we are in suspended mode
+	if (c_ui->pid == -1 && c_ui->suspended) {
+		return;
+	}
+
 	// check if we are in on_demand mode (the respawn will be ignored)
 	if (c_ui->pid == -1 && c_ui->on_demand_fd > -1) {
 		c_ui->last_mod = mod;
@@ -796,6 +1010,9 @@ void emperor_respawn(struct uwsgi_instance *c_ui, time_t mod) {
 		// reset accepting
 		c_ui->accepting = 0;
 		uwsgi_log_verbose("[emperor] updated configuration for \"on demand\" instance %s\n", c_ui->name);
+		if (uwsgi_hooks_run_and_return(uwsgi.hook_as_on_config_vassal, "as-on-config-vassal", c_ui->name, 0)) {
+			emperor_curse(c_ui);
+		}
 		return;
 	}
 
@@ -808,7 +1025,8 @@ void emperor_respawn(struct uwsgi_instance *c_ui, time_t mod) {
 	}
 
 	// push the config to the config pipe (if needed)
-	emperor_push_config(c_ui);
+	// changed in 2.1, the vassal asks for config blob
+	//emperor_push_config(c_ui);
 
 	c_ui->respawns++;
 	c_ui->last_mod = mod;
@@ -822,6 +1040,10 @@ void emperor_respawn(struct uwsgi_instance *c_ui, time_t mod) {
 }
 
 void emperor_add(struct uwsgi_emperor_scanner *ues, char *name, time_t born, char *config, uint32_t config_size, uid_t uid, gid_t gid, char *socket_name) {
+	emperor_add_with_attrs(ues, name, born, config, config_size, uid, gid, socket_name, NULL);
+}
+
+void emperor_add_with_attrs(struct uwsgi_emperor_scanner *ues, char *name, time_t born, char *config, uint32_t config_size, uid_t uid, gid_t gid, char *socket_name, struct uwsgi_dyn_dict *attrs) {
 
 	struct uwsgi_instance *c_ui = ui;
 	struct uwsgi_instance *n_ui = NULL;
@@ -850,24 +1072,34 @@ void emperor_add(struct uwsgi_emperor_scanner *ues, char *name, time_t born, cha
 		}
 	}
 
-	if (now - emperor_throttle < 1) {
-		emperor_throttle_level = emperor_throttle_level * 2;
+	if (emperor_warming_up) {
+		if (emperor_throttle_level > 0) {
+			// wait 10 milliseconds in case of fork-bombing
+			// pretty random value, but should avoid the load average to increase
+			usleep(10 * 1000);
+		}
 	}
 	else {
-		if (emperor_throttle_level > uwsgi.emperor_throttle) {
-			emperor_throttle_level = emperor_throttle_level / 2;
+		if (now - emperor_throttle < 1) {
+			emperor_throttle_level = emperor_throttle_level * 2;
+		}
+		else {
+			if (emperor_throttle_level > uwsgi.emperor_throttle) {
+				emperor_throttle_level = emperor_throttle_level / 2;
+			}
+
+			if (emperor_throttle_level < uwsgi.emperor_throttle) {
+				emperor_throttle_level = uwsgi.emperor_throttle;
+			}
 		}
 
-		if (emperor_throttle_level < uwsgi.emperor_throttle) {
-			emperor_throttle_level = uwsgi.emperor_throttle;
-		}
-	}
-
-	emperor_throttle = now;
+		emperor_throttle = now;
 #ifdef UWSGI_DEBUG
-	uwsgi_log("emperor throttle = %d\n", emperor_throttle_level);
+		uwsgi_log("emperor throttle = %d\n", emperor_throttle_level);
 #endif
-	usleep(emperor_throttle_level);
+
+		usleep(emperor_throttle_level * 1000);
+	}
 
 	if (uwsgi.emperor_tyrant) {
 		if (uid == 0 || gid == 0) {
@@ -911,6 +1143,9 @@ void emperor_add(struct uwsgi_emperor_scanner *ues, char *name, time_t born, cha
 	// start without loyalty
 	n_ui->last_loyal = 0;
 	n_ui->loyal = 0;
+	n_ui->suspended = 0;
+
+	n_ui->attrs = attrs;
 
 	n_ui->first_run = uwsgi_now();
 	n_ui->last_run = n_ui->first_run;
@@ -926,6 +1161,15 @@ void emperor_add(struct uwsgi_emperor_scanner *ues, char *name, time_t born, cha
 	n_ui->pipe_config[0] = -1;
 	n_ui->pipe_config[1] = -1;
 
+	// Check if the Emperor has to wait for a command before spawning a vassal
+	if (uwsgi.emperor_command_socket) {
+		if (uwsgi.emperor_wait_for_command && !uwsgi_string_list_has_item(uwsgi.emperor_wait_for_command_ignore, name, strlen(name))) {
+			n_ui->suspended = 1;
+			uwsgi_log("[uwsgi-emperor] %s -> \"wait-for-command\" instance detected, waiting for the spawn command ...\n", name);
+			return;
+		}
+	}
+
 	// ok here we check if we need to bind to the specified socket or continue with the activation
 	if (socket_name) {
 		n_ui->on_demand_fd = on_demand_bind(socket_name);
@@ -937,6 +1181,9 @@ void emperor_add(struct uwsgi_emperor_scanner *ues, char *name, time_t born, cha
 
 		event_queue_add_fd_read(uwsgi.emperor_queue, n_ui->on_demand_fd);
 		uwsgi_log("[uwsgi-emperor] %s -> \"on demand\" instance detected, waiting for connections on socket \"%s\" ...\n", name, socket_name);
+		if (uwsgi_hooks_run_and_return(uwsgi.hook_as_on_demand_vassal, "as-on-demand-vassal", name, 0)) {
+			emperor_del(n_ui);
+		}
 		return;
 	}
 
@@ -947,6 +1194,117 @@ void emperor_add(struct uwsgi_emperor_scanner *ues, char *name, time_t born, cha
 }
 
 static void uwsgi_emperor_spawn_vassal(struct uwsgi_instance *);
+
+static void vassal_fork_server_parser_hook(char *key, uint16_t key_len, char *value, uint16_t value_len, void *data) {
+	pid_t *pid = (pid_t *) data;
+
+        if (!uwsgi_strncmp(key, key_len, "pid", 3)) {
+		// ignore negative values
+		if (value_len > 0 && value[0] == '-') return;
+                *pid = uwsgi_str_num(value, value_len);
+        }
+}
+
+
+/*
+	there are max 3 file descriptors we need to pass to the fork server:
+
+	n_ui->pipe[1]
+	n_ui->pipe_config[1]
+	n_ui->on_demand_fd
+
+*/
+static pid_t emperor_connect_to_fork_server(char *socket, struct uwsgi_instance *n_ui) {
+	int fd = uwsgi_connect(socket, uwsgi.socket_timeout, 0);
+	if (fd < 0) {
+		uwsgi_error("emperor_connect_to_fork_server()/uwsgi_connect()");
+		return -1;
+	}
+
+	int slot_to_free = -1;
+	char **vassal_argv = vassal_new_argv(n_ui, &slot_to_free);
+
+	struct uwsgi_buffer *ub = uwsgi_buffer_new(uwsgi.page_size);
+	// leave space for uwsgi header
+	ub->pos = 4;
+	int error = 0, counter = 0;
+	while (vassal_argv[counter]) {
+		if (!error && uwsgi_buffer_u16le(ub, strlen(vassal_argv[counter])))
+			error = 1;
+		if (!error && uwsgi_buffer_append(ub, vassal_argv[counter], strlen(vassal_argv[counter])))
+			error = 1;
+		if (counter == slot_to_free)
+			free(vassal_argv[counter]);
+		counter++;
+	}
+
+	free(vassal_argv);
+	if (error) {
+		uwsgi_log_verbose("[uwsgi-emperor] %s: unable to complete fork-server session\n", n_ui->name);
+		goto end;
+	}
+
+	// bit 0 -> pipe (0x01)
+	// bit 1 -> config_pipe (0x02)
+	// bit 2 -> on_demand (0x04)
+	uint8_t modifier2_mask = 0x01;
+	int fds[8];
+	int fds_count = 1;
+	fds[0] = n_ui->pipe[1];
+
+	// add pipe config ?
+	if (n_ui->use_config) {
+		modifier2_mask |= 0x02;
+		fds[fds_count] = n_ui->pipe_config[1];
+		fds_count++;
+	}
+
+	// add ondemand ?
+	if (n_ui->on_demand_fd > -1) {
+		modifier2_mask |= 0x04;
+		fds[fds_count] = n_ui->on_demand_fd;
+		fds_count++;
+	}
+
+	// fix uwsgi header
+	if (uwsgi_buffer_set_uh(ub, 35, modifier2_mask)) goto end;
+
+	if (uwsgi_send_fds_and_body(fd, fds, fds_count, ub->buf, ub->pos)) {
+		uwsgi_log_verbose("[uwsgi-emperor] %s: unable to complete fork-server session\n", n_ui->name);
+		goto end;
+	}
+
+	uwsgi_buffer_destroy(ub);
+
+	// now wait for the response (the pid number)
+	// the response could contain various info, currently we only need the "pid" attribute
+	size_t buf_len = uwsgi.page_size;
+	char *buf = uwsgi_malloc(buf_len);
+	uint8_t modifier1 = 0;
+	uint8_t modifier2 = 0;
+	int ret = uwsgi_read_with_realloc(fd, &buf, &buf_len, uwsgi.socket_timeout, &modifier1, &modifier2);
+	if (ret) {
+		free(buf);
+		uwsgi_log_verbose("[uwsgi-emperor] %s: unable to complete fork-server session\n", n_ui->name);
+		goto end2;
+	}
+
+	pid_t pid = -1;
+	uwsgi_hooked_parse(buf, buf_len, vassal_fork_server_parser_hook, &pid);
+	free(buf);
+
+	// close the connection
+	close(fd);
+
+	// return the pid to the Emperor
+	return pid;
+
+end:
+	uwsgi_buffer_destroy(ub);
+end2:
+	close(fd);
+	return -1;
+}
 
 int uwsgi_emperor_vassal_start(struct uwsgi_instance *n_ui) {
 
@@ -972,20 +1330,36 @@ int uwsgi_emperor_vassal_start(struct uwsgi_instance *n_ui) {
 		uwsgi.emperor_broodlord_num++;
 	}
 
-	// TODO pre-start hook
 
-	// a new uWSGI instance will start 
+	if (uwsgi_hooks_run_and_return(uwsgi.hook_as_emperor_before_vassal, "as-emperor-before-vassal", NULL, 0)) {
+		return -1;
+        }
+
+	if (uwsgi.zeus) {
+		uwsgi_log("[zeus] ready to spawn instance \"%s\" ...\n", n_ui->name);
+		return uwsgi_zeus_spawn_instance(n_ui);
+	}
+
+	// check for fork server
+	char *fork_server = uwsgi.emperor_use_fork_server;
+	char *fork_server_attr = vassal_attr_get(n_ui, uwsgi.emperor_fork_server_attr);
+	if (fork_server_attr) fork_server = fork_server_attr;
+	// a new uWSGI instance will start
+	if (fork_server && !uwsgi_string_list_has_item(uwsgi.vassal_fork_base, n_ui->name, strlen(n_ui->name))) {
+		// pid can only be > 0 or -1
+		n_ui->adopted = 1;
+		pid = emperor_connect_to_fork_server(fork_server, n_ui);
+	}
 #if defined(__linux__) && !defined(OBSOLETE_LINUX_KERNEL) && !defined(__ia64__)
-	if (uwsgi.emperor_clone) {
+	else if (uwsgi.emperor_clone) {
 		char stack[PTHREAD_STACK_MIN];
 		pid = clone((int (*)(void *)) uwsgi_emperor_spawn_vassal, stack + PTHREAD_STACK_MIN, SIGCHLD | uwsgi.emperor_clone, (void *) n_ui);
 	}
+#endif
 	else {
-#endif
 		pid = fork();
-#if defined(__linux__) && !defined(OBSOLETE_LINUX_KERNEL) && !defined(__ia64__)
 	}
-#endif
+
 	if (pid < 0) {
 		uwsgi_error("uwsgi_emperor_spawn_vassal()/fork()")
 	}
@@ -1084,6 +1458,12 @@ int uwsgi_emperor_vassal_start(struct uwsgi_instance *n_ui) {
 				func(n_ui->name, n_ui->pid, n_ui->uid, n_ui->gid);
 			}
 		}
+
+#if defined(__linux__) && !defined(OBSOLETE_LINUX_KERNEL)
+		uwsgi_hooks_setns_run(uwsgi.hook_as_emperor_setns, n_ui->pid, n_ui->uid, n_ui->gid);
+#endif
+		// ensure the instance is no more suspended
+		n_ui->suspended = 0;
 		return 0;
 	}
 	else {
@@ -1120,6 +1500,8 @@ static void uwsgi_emperor_spawn_vassal(struct uwsgi_instance *n_ui) {
 		}
 	}
 #endif
+
+	uwsgi_hooks_run(uwsgi.hook_as_vassal_before_drop, "as-vassal-before-drop", 1);
 
 #ifdef UWSGI_CAP
 #if defined(CAP_LAST_CAP) && defined(PR_CAPBSET_READ) && defined(PR_CAPBSET_DROP)
@@ -1172,9 +1554,30 @@ static void uwsgi_emperor_spawn_vassal(struct uwsgi_instance *n_ui) {
 			uwsgi_error("setgid()");
 			exit(1);
 		}
-		if (setgroups(0, NULL)) {
-			uwsgi_error("setgroups()");
-			exit(1);
+
+		if (uwsgi.emperor_tyrant_initgroups) {
+			char *uidname = NULL;
+			gid_t gid = n_ui->gid;
+			struct passwd *pw = getpwuid(n_ui->uid);
+
+			if (pw) {
+				uidname = pw->pw_name;
+				gid = pw->pw_gid;
+			}
+
+			if (!uidname) {
+				uidname = uwsgi_num2str(n_ui->uid);
+			}
+
+			if (initgroups(uidname, gid)) {
+				uwsgi_error("initgroups()");
+				exit(1);
+			}
+		} else {
+			if (setgroups(0, NULL)) {
+				uwsgi_error("setgroups()");
+				exit(1);
+			}
 		}
 
 		if (setuid(n_ui->uid)) {
@@ -1250,103 +1653,8 @@ static void uwsgi_emperor_spawn_vassal(struct uwsgi_instance *n_ui) {
 		close(n_ui->pipe_config[0]);
 	}
 
-	int counter = 4;
-	struct uwsgi_string_list *uct;
-	uwsgi_foreach(uct, uwsgi.vassals_templates_before) counter += 2;
-	uwsgi_foreach(uct, uwsgi.vassals_includes_before) counter += 2;
-	uwsgi_foreach(uct, uwsgi.vassals_set) counter += 2;
-	uwsgi_foreach(uct, uwsgi.vassals_templates) counter += 2;
-	uwsgi_foreach(uct, uwsgi.vassals_includes) counter += 2;
+	char **vassal_argv = vassal_new_argv(n_ui, NULL);
 
-	char **vassal_argv = uwsgi_malloc(sizeof(char *) * counter);
-	// set args
-	vassal_argv[0] = uwsgi.emperor_wrapper ? uwsgi.emperor_wrapper : uwsgi.binary_path;
-
-	// reset counter
-	counter = 1;
-
-	uwsgi_foreach(uct, uwsgi.vassals_templates_before) {
-		vassal_argv[counter] = "--inherit";
-		vassal_argv[counter + 1] = uct->value;
-		counter += 2;
-	}
-
-	uwsgi_foreach(uct, uwsgi.vassals_includes_before) {
-		vassal_argv[counter] = "--include";
-		vassal_argv[counter + 1] = uct->value;
-		counter += 2;
-	}
-
-	uwsgi_foreach(uct, uwsgi.vassals_set) {
-		vassal_argv[counter] = "--set";
-		vassal_argv[counter + 1] = uct->value;
-		counter += 2;
-	}
-
-	char *colon = NULL;
-	if (uwsgi.emperor_broodlord) {
-		colon = strchr(n_ui->name, ':');
-		if (colon) {
-			colon[0] = 0;
-		}
-	}
-	// initialize to a default value
-	vassal_argv[counter] = "--inherit";
-
-	if (!strcmp(n_ui->name + (strlen(n_ui->name) - 4), ".xml"))
-		vassal_argv[counter] = "--xml";
-	if (!strcmp(n_ui->name + (strlen(n_ui->name) - 4), ".ini"))
-		vassal_argv[counter] = "--ini";
-	if (!strcmp(n_ui->name + (strlen(n_ui->name) - 4), ".yml"))
-		vassal_argv[counter] = "--yaml";
-	if (!strcmp(n_ui->name + (strlen(n_ui->name) - 5), ".yaml"))
-		vassal_argv[counter] = "--yaml";
-	if (!strcmp(n_ui->name + (strlen(n_ui->name) - 3), ".js"))
-		vassal_argv[counter] = "--json";
-	if (!strcmp(n_ui->name + (strlen(n_ui->name) - 5), ".json"))
-		vassal_argv[counter] = "--json";
-	struct uwsgi_string_list *usl = uwsgi.emperor_extra_extension;
-	while (usl) {
-		if (uwsgi_endswith(n_ui->name, usl->value)) {
-			vassal_argv[counter] = "--config";
-			break;
-		}
-		usl = usl->next;
-	}
-	if (colon)
-		colon[0] = ':';
-
-	// start config filename...
-	counter++;
-
-	vassal_argv[counter] = n_ui->name;
-	if (uwsgi.emperor_magic_exec) {
-		if (!access(n_ui->name, R_OK | X_OK)) {
-			vassal_argv[counter] = uwsgi_concat2("exec://", n_ui->name);
-		}
-
-	}
-
-	if (n_ui->use_config) {
-		vassal_argv[counter] = uwsgi_concat2("emperor://", n_ui->name);
-	}
-
-	// start templates,includes,inherit...
-	counter++;
-
-	uwsgi_foreach(uct, uwsgi.vassals_templates) {
-		vassal_argv[counter] = "--inherit";
-		vassal_argv[counter + 1] = uct->value;
-		counter += 2;
-	}
-
-	uwsgi_foreach(uct, uwsgi.vassals_includes) {
-		vassal_argv[counter] = "--include";
-		vassal_argv[counter + 1] = uct->value;
-		counter += 2;
-	}
-
-	vassal_argv[counter] = NULL;
 
 	// disable stdin OR map it to the "on demand" socket
 	if (n_ui->on_demand_fd > -1) {
@@ -1389,6 +1697,7 @@ static void uwsgi_emperor_spawn_vassal(struct uwsgi_instance *n_ui) {
 
 	uwsgi_hooks_run(uwsgi.hook_as_vassal, "as-vassal", 1);
 
+	struct uwsgi_string_list *usl = NULL;
 	uwsgi_foreach(usl, uwsgi.mount_as_vassal) {
 		uwsgi_log("mounting \"%s\" (as-vassal)...\n", usl->value);
 		if (uwsgi_mount_hook(usl->value)) {
@@ -1441,18 +1750,38 @@ static void uwsgi_emperor_spawn_vassal(struct uwsgi_instance *n_ui) {
 		func(n_ui->name, n_ui->uid, n_ui->gid);
 	}
 
+	char *force_chdir = vassal_attr_get(n_ui, uwsgi.emperor_chdir_attr);
+	if (force_chdir) {
+		if (chdir(force_chdir)) {
+			uwsgi_error("--emperor-chdir-attr/chdir()");
+			exit(UWSGI_EXILE_CODE);
+		}
+	}
+
 	// ->vassal_before_exec
 	for (i = 0; i < 256; i++) {
                 if (uwsgi.p[i]->vassal_before_exec) {
-                        uwsgi.p[i]->vassal_before_exec(n_ui);
+                        uwsgi.p[i]->vassal_before_exec(n_ui, vassal_argv);
                 }
         }
 
         for (i = 0; i < uwsgi.gp_cnt; i++) {
-                if (uwsgi.gp[i]->vassal) {
-                        uwsgi.gp[i]->vassal_before_exec(n_ui);
+                if (uwsgi.gp[i]->vassal_before_exec) {
+                        uwsgi.gp[i]->vassal_before_exec(n_ui, vassal_argv);
                 }
         }
+
+	
+	if (uwsgi.emperor_wrapper_override) {
+		char *orig_wrapper = vassal_argv[0];	
+		uwsgi_foreach(usl, uwsgi.emperor_wrapper_override) {
+			vassal_argv[0] = usl->value;
+			uwsgi_log("[emperor] trying to use %s as binary wrapper ...\n", usl->value);
+			execvp(vassal_argv[0], vassal_argv);
+			// not here if the binary is found
+		}
+		vassal_argv[0] = orig_wrapper;
+	}
 
 	// start !!!
 	if (execvp(vassal_argv[0], vassal_argv)) {
@@ -1460,6 +1789,14 @@ static void uwsgi_emperor_spawn_vassal(struct uwsgi_instance *n_ui) {
 	}
 	uwsgi_log("[emperor] binary path: %s\n", vassal_argv[0]);
 	uwsgi_log("[emperor] is the uwsgi binary in your system PATH ?\n");
+
+	// trying fallback
+	uwsgi_foreach(usl, uwsgi.emperor_wrapper_fallback) {
+		uwsgi_log("[emperor] trying to use %s as binary fallback ...\n", usl->value);
+                vassal_argv[0] = usl->value;
+                execvp(vassal_argv[0], vassal_argv);
+                // not here if the binary is found
+        }
 	// never here
 	exit(UWSGI_EXILE_CODE);
 }
@@ -1554,6 +1891,7 @@ void uwsgi_emperor_run_scanners(void) {
 		ues->monitor->func(ues);
 		ues = ues->next;
 	}
+	emperor_warming_up = 0;
 }
 
 void emperor_build_scanners() {
@@ -1603,16 +1941,32 @@ int uwsgi_emperor_scanner_event(int fd) {
 static void emperor_wakeup(int sn) {
 }
 
-static void emperor_cleanup() {
-	uwsgi_log_verbose("[uwsgi-emperor] cleaning up blacklist ...\n");
-	struct uwsgi_instance *ui_current = ui;
-	while (ui_current->ui_next) {
-		uwsgi_emperor_blacklist_remove(ui_current->name);
-		ui_current = ui_current->ui_next;
+static void emperor_cleanup(int signum) {
+	uwsgi_log_verbose("[emperor] cleaning up blacklist ...\n");
+	struct uwsgi_emperor_blacklist_item *uebi = emperor_blacklist;
+	while (uebi) {
+		struct uwsgi_emperor_blacklist_item *next = uebi->next;
+		free(uebi);
+		uebi = next;
 	}
+	emperor_blacklist = NULL;
 }
 
 void emperor_loop() {
+
+#if defined(__linux__) && defined(PR_SET_CHILD_SUBREAPER)
+        if (uwsgi.emperor_use_fork_server || uwsgi.emperor_subreaper || uwsgi.emperor_fork_server_attr) {
+                if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)) {
+                        uwsgi_error("uwsgi_fork_server()/fork()");
+                        exit(1);
+                }
+        }
+#else
+	if (uwsgi.emperor_use_fork_server || uwsgi.emperor_subreaper || uwsgi.emperor_fork_server_attr) {
+		uwsgi_log("*** DANGER: your kernel misses PR_SET_CHILD_SUBREAPER feature, required by the fork server ***\n");
+		uwsgi_log("*** your Emperor will not be able to correctly wait() on vassals ***\n");
+	}
+#endif
 
 	// monitor a directory
 
@@ -1658,6 +2012,7 @@ void emperor_loop() {
 	uwsgi.max_fd = rl.rlim_cur;
 
 	emperor_throttle_level = uwsgi.emperor_throttle;
+	emperor_throttle = 0;
 
 	// the queue must be initialized before adding scanners
 	uwsgi.emperor_queue = event_queue_init();
@@ -1689,6 +2044,33 @@ void emperor_loop() {
 		event_queue_add_fd_read(uwsgi.emperor_queue, uwsgi.emperor_stats_fd);
 		uwsgi_log("*** Emperor stats server enabled on %s fd: %d ***\n", uwsgi.emperor_stats, uwsgi.emperor_stats_fd);
 	}
+
+
+	if (uwsgi.emperor_trigger_socket) {
+		char *tcp_port = strchr(uwsgi.emperor_trigger_socket, ':');
+                if (tcp_port) {
+                        uwsgi.emperor_trigger_socket_fd = bind_to_tcp(uwsgi.emperor_trigger_socket, uwsgi.listen_queue, tcp_port);
+                }
+                else {
+                        uwsgi.emperor_trigger_socket_fd = bind_to_unix(uwsgi.emperor_trigger_socket, uwsgi.listen_queue, uwsgi.chmod_socket, uwsgi.abstract_socket);
+                }
+
+                event_queue_add_fd_read(uwsgi.emperor_queue, uwsgi.emperor_trigger_socket_fd);
+                uwsgi_log("*** Emperor trigger socket enabled on %s fd: %d ***\n", uwsgi.emperor_trigger_socket, uwsgi.emperor_trigger_socket_fd);
+	}
+
+	if (uwsgi.emperor_command_socket) {
+                char *udp_port = strchr(uwsgi.emperor_command_socket, ':');
+                if (udp_port) {
+                        uwsgi.emperor_command_socket_fd = bind_to_udp(uwsgi.emperor_command_socket, 0, 0);
+                }
+                else {
+                        uwsgi.emperor_command_socket_fd = bind_to_unix_dgram(uwsgi.emperor_command_socket);
+                }
+
+                event_queue_add_fd_read(uwsgi.emperor_queue, uwsgi.emperor_command_socket_fd);
+                uwsgi_log("*** Emperor command socket enabled on %s fd: %d ***\n", uwsgi.emperor_command_socket, uwsgi.emperor_command_socket_fd);
+        }
 
 	ui = &ui_base;
 
@@ -1755,6 +2137,11 @@ void emperor_loop() {
 				continue;
 			}
 
+			if (uwsgi.emperor_command_socket && uwsgi.emperor_command_socket_fd > -1 && interesting_fd == uwsgi.emperor_command_socket_fd) {
+				emperor_manage_command(uwsgi.emperor_command_socket_fd);
+				continue;
+			}
+
 			// check if a monitor is mapped to that file descriptor
 			if (uwsgi_emperor_scanner_event(interesting_fd)) {
 				continue;
@@ -1789,7 +2176,7 @@ void emperor_loop() {
 						ui_current->last_heartbeat = uwsgi_now();
 					}
 					else if (byte == 22) {
-						// command 22 changes meaning when in "on_demand" mode  
+						// command 22 changes meaning when in "on_demand" mode
 						if (ui_current->on_demand_fd != -1) {
 							emperor_back_to_ondemand(ui_current);
 						}
@@ -1902,6 +2289,7 @@ recheck:
 				uwsgi_error("waitpid()");
 			}
 		}
+
 		ui_current = ui;
 		while (ui_current->ui_next) {
 			ui_current = ui_current->ui_next;
@@ -1924,17 +2312,17 @@ recheck:
 							socket_name = uwsgi_str(ui_current->socket_name);
 						}
 						emperor_add(ui_current->scanner, ui_current->name, ui_current->last_mod, config, ui_current->config_len, ui_current->uid, ui_current->gid, socket_name);
-						// temporarily set frequency to 0, so we can eventually fast-restart the instance
 						emperor_del(ui_current);
-						freq = 0;
+						// temporarily set frequency to 1, so we can eventually fast-restart the instance
+						freq = 1;
 					}
 					break;
 				}
 				else if (ui_current->status == 1) {
 					// remove 'marked for dead' instance
 					emperor_del(ui_current);
-					// temporarily set frequency to 0, so we can eventually fast-restart the instance
-					freq = 0;
+					// temporarily set frequency to 1, so we can eventually fast-restart the instance
+					freq = 1;
 					break;
 				}
 				// back to on_demand mode ...
@@ -1952,14 +2340,18 @@ recheck:
 					ui_current->ready = 0;
 					ui_current->accepting = 0;
 					uwsgi_log("[uwsgi-emperor] %s -> back to \"on demand\" mode, waiting for connections on socket \"%s\" ...\n", ui_current->name, ui_current->socket_name);
+					if (uwsgi_hooks_run_and_return(uwsgi.hook_as_on_demand_vassal, "as-on-demand-vassal", ui_current->name, 0)) {
+						emperor_del(ui_current);
+						freq = 1;
+					}
 					break;
 				}
 			}
 			else if (ui_current->cursed_at > 0) {
 				if (ui_current->pid == -1) {
 					emperor_del(ui_current);
-					// temporarily set frequency to 0, so we can eventually fast-restart the instance
-					freq = 0;
+					// temporarily set frequency to 1, so we can eventually fast-restart the instance
+					freq = 1;
 					break;
 				}
 				else if (now - ui_current->cursed_at >= uwsgi.emperor_curse_tolerance) {
@@ -1987,7 +2379,142 @@ recheck:
 
 }
 
-void emperor_send_stats(int fd) {
+// manage commands sentto the dgram command socket
+struct emperor_command {
+	char *cmd;
+	uint16_t cmd_len;
+	char *vassal;
+	uint16_t vassal_len;
+	char *msg;
+	uint16_t msg_len;
+};
+static void emperor_manage_command_parser(char *key, uint16_t keylen, char *val, uint16_t vallen, void *data) {
+
+        struct emperor_command *ec = (struct emperor_command *) data;
+
+        if (!uwsgi_strncmp("cmd", 3, key, keylen)) {
+                ec->cmd = val;
+                ec->cmd_len = vallen;
+        }
+        else if (!uwsgi_strncmp("command", 7, key, keylen)) {
+                ec->cmd = val;
+                ec->cmd_len = vallen;
+        }
+        else if (!uwsgi_strncmp("vassal", 6, key, keylen)) {
+                ec->vassal = val;
+                ec->vassal_len = vallen;
+        }
+        else if (!uwsgi_strncmp("msg", 3, key, keylen)) {
+                ec->msg = val;
+                ec->msg_len = vallen;
+        }
+}
+
+static void emperor_command_spawn(struct emperor_command *ec) {
+	if (ec->vassal_len == 0) {
+		uwsgi_log("[uwsgi-emperor] ERROR: the \"spawn\" command requires a vassal name\n");
+		return;
+	}
+	char *name = uwsgi_concat2n(ec->vassal, ec->vassal_len, "", 0);
+	struct uwsgi_instance *vassal = emperor_get(name);
+	if (!vassal) {
+		uwsgi_log("[uwsgi-emperor] ERROR: unable to find vassal \"%s\"\n", name);
+		free(name);
+		return;
+	}
+	if (!vassal->suspended) {
+		uwsgi_log("[uwsgi-emperor] WARNING: the vassal \"%s\" is already active\n", name);
+		free(name);
+		return;
+	}
+	uwsgi_log("[uwsgi-emperor] INFO: requested the spawn of vassal \"%s\"\n", name);
+	free(name);
+	// start the vassal
+	if (uwsgi_emperor_vassal_start(vassal)) {
+                // clear the vassal
+                emperor_del(vassal);
+        }
+}
+
+static void emperor_command_respawn(struct emperor_command *ec) {
+        if (ec->vassal_len == 0) {
+                uwsgi_log("[uwsgi-emperor] ERROR: the \"respawn\" command requires a vassal name\n");
+                return;
+        }
+        char *name = uwsgi_concat2n(ec->vassal, ec->vassal_len, "", 0);
+        struct uwsgi_instance *vassal = emperor_get(name);
+        if (!vassal) {
+                uwsgi_log("[uwsgi-emperor] ERROR: unable to find vassal \"%s\"\n", name);
+                free(name);
+                return;
+        }
+        uwsgi_log("[uwsgi-emperor] INFO: requested the respawn of vassal \"%s\"\n", name);
+        free(name);
+        // restart the vassal
+	emperor_respawn(vassal, uwsgi_now());
+}
+
+static void emperor_command_stop(struct emperor_command *ec) {
+        if (ec->vassal_len == 0) {
+                uwsgi_log("[uwsgi-emperor] ERROR: the \"stop\" command requires a vassal name\n");
+                return;
+        }
+        char *name = uwsgi_concat2n(ec->vassal, ec->vassal_len, "", 0);
+        struct uwsgi_instance *vassal = emperor_get(name);
+        if (!vassal) {
+                uwsgi_log("[uwsgi-emperor] ERROR: unable to find vassal \"%s\"\n", name);
+                free(name);
+                return;
+        }
+        uwsgi_log("[uwsgi-emperor] INFO: requested the stop of vassal \"%s\"\n", name);
+        free(name);
+        // stop the vassal
+        emperor_stop(vassal);
+}
+
+static void emperor_command_log(struct emperor_command *ec) {
+        if (ec->msg_len == 0) {
+                uwsgi_log("[uwsgi-emperor] ERROR: the \"log\" command requires a message\n");
+                return;
+        }
+	uwsgi_log("%.*s\n", ec->msg_len, ec->msg);
+}
+
+static void emperor_manage_command(int fd) {
+	char buf[4096];
+        ssize_t len = recv(fd, buf, 4096, 0);
+	if (len <= 0) return;
+	struct emperor_command ec;
+	memset(&ec, 0, sizeof(struct emperor_command));
+	uwsgi_hooked_parse(buf + 4, len - 4, emperor_manage_command_parser, &ec);
+	if (ec.cmd_len == 0) return;
+
+	// spawn a suspended vassal
+	if (!uwsgi_strncmp(ec.cmd, ec.cmd_len, "spawn", 5)) {
+		emperor_command_spawn(&ec);
+		return;
+	}
+
+	// respawn a vassal
+	if (!uwsgi_strncmp(ec.cmd, ec.cmd_len, "respawn", 7)) {
+		emperor_command_respawn(&ec);
+		return;
+	}
+
+	// stop a vassal
+	if (!uwsgi_strncmp(ec.cmd, ec.cmd_len, "stop", 4)) {
+		emperor_command_stop(&ec);
+		return;
+	}
+
+	// log a message
+	if (!uwsgi_strncmp(ec.cmd, ec.cmd_len, "log", 3)) {
+		emperor_command_log(&ec);
+		return;
+	}
+}
+
+static void emperor_send_stats(int fd) {
 
 	struct sockaddr_un client_src;
 	socklen_t client_src_len = 0;
@@ -2093,6 +2620,12 @@ void emperor_send_stats(int fd) {
 		if (uwsgi_stats_keyval_comma(us, "on_demand", c_ui->socket_name ? c_ui->socket_name : ""))
 			goto end0;
 
+		if (uwsgi_stats_keylong_comma(us, "suspended", (unsigned long long) c_ui->suspended))
+			goto end0;
+
+		if (uwsgi_stats_keylong_comma(us, "adopted", (unsigned long long) c_ui->adopted))
+			goto end0;
+
 		if (uwsgi_stats_keylong_comma(us, "uid", (unsigned long long) c_ui->uid))
 			goto end0;
 		if (uwsgi_stats_keylong_comma(us, "gid", (unsigned long long) c_ui->gid))
@@ -2100,6 +2633,31 @@ void emperor_send_stats(int fd) {
 
 		if (uwsgi_stats_keyval_comma(us, "monitor", c_ui->scanner->arg))
 			goto end0;
+
+		if (uwsgi_stats_key(us, "attrs"))
+                        goto end0;
+
+		if (uwsgi_stats_list_open(us))
+			goto end0;
+
+		struct uwsgi_dyn_dict *attrs = c_ui->attrs;
+		while(attrs) {
+			if (attrs->next) {
+				if (uwsgi_stats_keyval_comma(us, attrs->key, attrs->value))
+                        		goto end0;
+			}
+			else {
+				if (uwsgi_stats_keyval(us, attrs->key, attrs->value))
+                        		goto end0;
+			}
+			attrs = attrs->next;
+		}
+
+		if (uwsgi_stats_list_close(us))
+			goto end0;
+
+		if (uwsgi_stats_comma(us))
+                                goto end0;
 
 		if (uwsgi_stats_keylong(us, "respawns", (unsigned long long) c_ui->respawns))
 			goto end0;
@@ -2239,7 +2797,7 @@ void uwsgi_check_emperor() {
 				sleep(1);
 				continue;
 			}
-			int count = 2;
+			int count = 3;
 			int *fds = uwsgi_attach_fd(proxy_fd, &count, "uwsgi-emperor", 13);
 			if (fds && count > 0) {
 				char *env_emperor_fd = uwsgi_num2str(fds[0]);
@@ -2252,18 +2810,47 @@ void uwsgi_check_emperor() {
 					goto next;
 				}
 				free(env_emperor_fd);
-				if (count > 1) {
-					char *env_emperor_fd_config = uwsgi_num2str(fds[1]);
-					if (setenv("UWSGI_EMPEROR_FD_CONFIG", env_emperor_fd_config, 1)) {
-						uwsgi_error("uwsgi_check_emperor()/setenv(UWSGI_EMPEROR_FD_CONFIG)");
-						free(env_emperor_fd_config);
-						int i;
-						for (i = 0; i < count; i++)
-							close(fds[i]);
-						goto next;
+				int i;
+				for(i=1;i<count;i++) {
+					if (fds[i] < 0) continue;
+
+					char *socket_name = uwsgi_getsockname(fds[i]);
+					if (!socket_name) {
+						int j;
+                                                for (j = 0; j < count; j++)
+                                                        close(fds[j]);
+                                                goto next;
 					}
-					free(env_emperor_fd_config);
+					if (socket_name[0] != 0) {
+						// map the socket to fd0
+						if (fds[i] != 0) {
+							if (dup2(fds[i], 0) < 0) {
+								uwsgi_error("uwsgi_check_emperor()/dup2()");
+								int j;
+                                                		for (j = 0; j < count; j++)
+                                                        		close(fds[j]);
+                                                		goto next;
+							}
+							close(fds[i]);
+						}
+					}
+					else {
+						char *env_emperor_fd_config = uwsgi_num2str(fds[i]);
+						if (setenv("UWSGI_EMPEROR_FD_CONFIG", env_emperor_fd_config, 1)) {
+							uwsgi_error("uwsgi_check_emperor()/setenv(UWSGI_EMPEROR_FD_CONFIG)");
+							free(env_emperor_fd_config);
+							int j;
+							for (j = 0; j < count; j++)
+								close(fds[j]);
+							goto next;
+						}
+						free(env_emperor_fd_config);
+					}
+					free(socket_name);
 				}
+				if (fds)
+					free(fds);
+				close(proxy_fd);
 				break;
 			}
 next:
@@ -2289,14 +2876,20 @@ next:
 
 }
 
-void uwsgi_emperor_simple_do(struct uwsgi_emperor_scanner *ues, char *name, char *config, time_t ts, uid_t uid, gid_t gid, char *socket_name) {
-
-	if (!uwsgi_emperor_is_valid(name))
+void uwsgi_emperor_simple_do_with_attrs(struct uwsgi_emperor_scanner *ues, char *name, char *config, time_t ts, uid_t uid, gid_t gid, char *socket_name, struct uwsgi_dyn_dict *attrs) {
+	if (!uwsgi_emperor_is_valid(name)) {
+		if (attrs)
+			uwsgi_dyn_dict_free(&attrs);
 		return;
+	}
 
 	struct uwsgi_instance *ui_current = emperor_get(name);
 
 	if (ui_current) {
+		if (ui_current->attrs) {
+			uwsgi_dyn_dict_free(&ui_current->attrs);
+		}
+		ui_current->attrs = attrs;
 
 		// skip in case the instance is going down...
 		if (ui_current->status > 0)
@@ -2312,8 +2905,8 @@ void uwsgi_emperor_simple_do(struct uwsgi_emperor_scanner *ues, char *name, char
 		}
 		// check if mtime is changed and the uWSGI instance must be reloaded
 		if (ts > ui_current->last_mod) {
-			// now we neeed a special check for allowing an instance to move to "on_demand" mode (and back)
-			// allowing means "stoppping the instance"
+			// now we need a special check for allowing an instance to move to "on_demand" mode (and back)
+			// allowing means "stopping the instance"
 			if ((!ui_current->socket_name && ui_current->on_demand_fd == -1) && socket_name) {
 				uwsgi_log("[uwsgi-emperor] %s -> requested move to \"on demand\" mode for socket \"%s\" ...\n", name, socket_name);
 				emperor_stop(ui_current);
@@ -2344,8 +2937,16 @@ void uwsgi_emperor_simple_do(struct uwsgi_emperor_scanner *ues, char *name, char
 			new_config = uwsgi_str(config);
 			new_config_len = strlen(new_config);
 		}
-		emperor_add(ues, name, ts, new_config, new_config_len, uid, gid, socket_name);
+
+		if (attrs)
+			emperor_add_with_attrs(ues, name, ts, new_config, new_config_len, uid, gid, socket_name, attrs);
+		else
+			emperor_add(ues, name, ts, new_config, new_config_len, uid, gid, socket_name);
 	}
+}
+
+void uwsgi_emperor_simple_do(struct uwsgi_emperor_scanner *ues, char *name, char *config, time_t ts, uid_t uid, gid_t gid, char *socket_name) {
+	uwsgi_emperor_simple_do_with_attrs(ues, name, config, ts, uid, gid, socket_name, NULL);
 }
 
 void uwsgi_master_manage_emperor() {
@@ -2399,19 +3000,21 @@ void uwsgi_master_manage_emperor() {
 
 }
 
-void uwsgi_master_manage_emperor_proxy() {
+void uwsgi_master_manage_emperor_proxy(int server_fd, int emperor_fd, int emperor_fd_config, int socket_fd) {
 
 	struct sockaddr_un epsun;
 	socklen_t epsun_len = sizeof(struct sockaddr_un);
 
-	int ep_client = accept(uwsgi.emperor_fd_proxy, (struct sockaddr *) &epsun, &epsun_len);
+	int ep_client = accept(server_fd, (struct sockaddr *) &epsun, &epsun_len);
 	if (ep_client < 0) {
 		uwsgi_error("uwsgi_master_manage_emperor_proxy()/accept()");
 		return;
 	}
 
 	int num_fds = 1;
-	if (uwsgi.emperor_fd_config > -1)
+	if (emperor_fd_config > -1)
+		num_fds++;
+	if (socket_fd > -1)
 		num_fds++;
 
 	struct msghdr ep_msg;
@@ -2441,9 +3044,15 @@ void uwsgi_master_manage_emperor_proxy() {
 
 	unsigned char *ep_fd_ptr = CMSG_DATA(cmsg);
 
-	memcpy(ep_fd_ptr, &uwsgi.emperor_fd, sizeof(int));
-	if (num_fds > 1) {
-		memcpy(ep_fd_ptr + sizeof(int), &uwsgi.emperor_fd_config, sizeof(int));
+	memcpy(ep_fd_ptr, &emperor_fd, sizeof(int));
+	if (emperor_fd_config > -1) {
+		ep_fd_ptr += sizeof(int);
+		memcpy(ep_fd_ptr, &emperor_fd_config, sizeof(int));
+	}
+
+	if (socket_fd > -1) {
+		ep_fd_ptr += sizeof(int);
+		memcpy(ep_fd_ptr, &socket_fd, sizeof(int));
 	}
 
 	if (sendmsg(ep_client, &ep_msg, 0) < 0) {

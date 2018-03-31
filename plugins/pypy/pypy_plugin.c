@@ -66,17 +66,34 @@ static int uwsgi_pypy_init() {
 	}
 	else {
 		if (upypy.home) {
+			// first try with /bin way:
 #ifdef __CYGWIN__
-                        char *libpath = uwsgi_concat2(upypy.home, "/libpypy-c.dll");
+                        char *libpath = uwsgi_concat2(upypy.home, "/bin/libpypy-c.dll");
 #elif defined(__APPLE__)
-                        char *libpath = uwsgi_concat2(upypy.home, "/libpypy-c.dylib");
+                        char *libpath = uwsgi_concat2(upypy.home, "/bin/libpypy-c.dylib");
 #else
-                        char *libpath = uwsgi_concat2(upypy.home, "/libpypy-c.so");
+                        char *libpath = uwsgi_concat2(upypy.home, "/bin/libpypy-c.so");
 #endif
 			if (uwsgi_file_exists(libpath)) {
-				upypy.handler = dlopen(libpath, RTLD_NOW | RTLD_GLOBAL);
+                                upypy.handler = dlopen(libpath, RTLD_NOW | RTLD_GLOBAL);
+                        }
+                        free(libpath);
+
+			// fallback to old-style way
+			if (!upypy.handler) {
+			
+#ifdef __CYGWIN__
+                        	char *libpath = uwsgi_concat2(upypy.home, "/libpypy-c.dll");
+#elif defined(__APPLE__)
+                        	char *libpath = uwsgi_concat2(upypy.home, "/libpypy-c.dylib");
+#else
+                        	char *libpath = uwsgi_concat2(upypy.home, "/libpypy-c.so");
+#endif
+				if (uwsgi_file_exists(libpath)) {
+					upypy.handler = dlopen(libpath, RTLD_NOW | RTLD_GLOBAL);
+				}
+				free(libpath);
 			}
-			free(libpath);
 		}
 		// fallback to standard library search path
 		if (!upypy.handler) {
@@ -162,6 +179,15 @@ ready:
 		if (start && end) {
 			buffer = uwsgi_concat2n(start, end-start, "", 0);
 		}
+#if defined(__APPLE__)
+		else {
+			unsigned long setup_size = 0;
+			char *setup_data = (char*)getsectiondata(&_mh_execute_header, "__DATA", "pypy_setup", &setup_size);
+			if (setup_data) {
+				buffer = uwsgi_concat2n(setup_data, setup_size, "", 0);
+			}
+		}
+#endif
 	}
 
 	if (!buffer) {
@@ -207,7 +233,7 @@ static void uwsgi_pypy_preinit_apps() {
 
 static int uwsgi_pypy_request(struct wsgi_request *wsgi_req) {
 	/* Standard WSGI request */
-        if (!wsgi_req->uh->pktsize) {
+        if (!wsgi_req->len) {
                 uwsgi_log( "Empty pypy request. skip.\n");
                 return -1;
         }

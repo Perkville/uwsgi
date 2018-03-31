@@ -32,6 +32,8 @@ int uwsgi_routing_func_static(struct wsgi_request *wsgi_req, struct uwsgi_route 
 
 	uwsgi_file_serve(wsgi_req, ub->buf, ub->pos, NULL, 0, 1);
 	uwsgi_buffer_destroy(ub);
+	if (ur->custom == 1)
+		return UWSGI_ROUTE_NEXT;
 	return UWSGI_ROUTE_BREAK;
 }
 
@@ -67,7 +69,10 @@ int uwsgi_routing_func_file(struct wsgi_request *wsgi_req, struct uwsgi_route *u
 	// static file - don't update avg_rt after request
 	wsgi_req->do_not_account_avg_rt = 1;
 
-	if (urfc->no_headers) goto send;
+	if (urfc->no_headers) {
+		uwsgi_buffer_destroy(ub_s);
+		goto send;
+	}
 
 	if (uwsgi_response_prepare_headers(wsgi_req, ub_s->buf, ub_s->pos)) {
 		uwsgi_buffer_destroy(ub_s);
@@ -138,7 +143,10 @@ int uwsgi_routing_func_sendfile(struct wsgi_request *wsgi_req, struct uwsgi_rout
         // static file - don't update avg_rt after request
         wsgi_req->do_not_account_avg_rt = 1;
 
-	if (urfc->no_headers) goto send;
+	if (urfc->no_headers) {
+                uwsgi_buffer_destroy(ub_s);
+		goto send;
+	}
 
         if (uwsgi_response_prepare_headers(wsgi_req, ub_s->buf, ub_s->pos)) {
                 uwsgi_buffer_destroy(ub_s);
@@ -208,7 +216,10 @@ int uwsgi_routing_func_fastfile(struct wsgi_request *wsgi_req, struct uwsgi_rout
         // static file - don't update avg_rt after request
         wsgi_req->do_not_account_avg_rt = 1;
 
-	if (urfc->no_headers) goto send;
+	if (urfc->no_headers) {
+                uwsgi_buffer_destroy(ub_s);
+		goto send;
+	}
 
         if (uwsgi_response_prepare_headers(wsgi_req, ub_s->buf, ub_s->pos)) {
                 uwsgi_buffer_destroy(ub_s);
@@ -237,7 +248,7 @@ send:
         }
 
 	if (wsgi_req->socket->can_offload) {
-		if (!uwsgi_offload_request_sendfile_do(wsgi_req, fd, st.st_size)) {
+		if (!uwsgi_offload_request_sendfile_do(wsgi_req, fd, 0, st.st_size)) {
                         wsgi_req->via = UWSGI_VIA_OFFLOAD;
                         wsgi_req->response_size += st.st_size;
                 	// the fd will be closed by the offload engine
@@ -260,11 +271,15 @@ end:
 
 
 static int uwsgi_router_static(struct uwsgi_route *ur, char *args) {
-
 	ur->func = uwsgi_routing_func_static;
 	ur->data = args;
 	ur->data_len = strlen(args);
 	return 0;
+}
+
+static int uwsgi_router_static_next(struct uwsgi_route *ur, char *args) {
+	ur->custom = 1;
+	return uwsgi_router_static(ur, args);
 }
 
 static int uwsgi_router_file(struct uwsgi_route *ur, char *args) {
@@ -287,7 +302,8 @@ static int uwsgi_router_file(struct uwsgi_route *ur, char *args) {
 	}
 
 	if (!urfc->filename) {
-		uwsgi_log("you have to specifify a filename for the \"file\" router\n");
+		uwsgi_log("you have to specify a filename for the \"file\" router\n");
+		free(urfc);
 		return -1;
 	}
 
@@ -340,6 +356,7 @@ static int uwsgi_router_fastfile_next(struct uwsgi_route *ur, char *args) {
 static void router_static_register(void) {
 
 	uwsgi_register_router("static", uwsgi_router_static);
+	uwsgi_register_router("static-next", uwsgi_router_static_next);
 	uwsgi_register_router("file", uwsgi_router_file);
 	uwsgi_register_router("file-next", uwsgi_router_file_next);
 	uwsgi_register_router("sendfile", uwsgi_router_sendfile);

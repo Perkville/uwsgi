@@ -46,10 +46,10 @@ int uwsgi_read_response(int fd, struct uwsgi_header *uh, int timeout, char **buf
 		break;
 	}
 
-	if (buf && uh->pktsize > 0) {
+	if (buf && uh->_pktsize > 0) {
 		if (*buf == NULL)
-			*buf = uwsgi_malloc(uh->pktsize);
-		remains = uh->pktsize;
+			*buf = uwsgi_malloc(uh->_pktsize);
+		remains = uh->_pktsize;
 		ptr = *buf;
 		ret = -1;
 		while (remains > 0) {
@@ -228,7 +228,8 @@ static int uwsgi_proto_check_9(struct wsgi_request *wsgi_req, char *key, char *b
 	return 0;
 }
 
-static void uwsgi_parse_http_range(char *buf, uint16_t len, size_t *from, size_t *to) {
+static void uwsgi_parse_http_range(char *buf, uint16_t len, enum uwsgi_range *parsed, int64_t *from, int64_t *to) {
+	*parsed = UWSGI_RANGE_INVALID;
 	*from = 0;
 	*to = 0;
 	uint16_t rlen = 0;
@@ -248,29 +249,56 @@ static void uwsgi_parse_http_range(char *buf, uint16_t len, size_t *from, size_t
 	rlen -= 6;
 	char *dash = memchr(range, '-', rlen);
 	if (!dash) return;
-	*from = uwsgi_str_num(range, dash-range);
-	*to = uwsgi_str_num(dash+1, rlen - ((dash+1)-range));
-	if (*to > 0 && *from > *to) {
-		*from = 0;
-		*to = 0;
+	if (dash != range) {
+		*from = uwsgi_str_num(range, dash-range);
+		if (dash == range+(rlen-1)) {
+			/* RFC7233 prefix range
+			 * `bytes=start-` is a same as `byte=start-0x7ffffffffffffff`
+			 */
+			*to = INT64_MAX;
+		} else {
+			*to = uwsgi_str_num(dash+1, rlen - ((dash+1)-range));
+		}
+		if (*to >= *from) {
+			*parsed = UWSGI_RANGE_PARSED;
+		} else {
+			*from = 0;
+			*to = 0;
+		}
+	} else {
+		/* RFC7233 suffix-byte-range-spec: `bytes=-500` */
+		*from = -(int64_t)uwsgi_str_num(dash+1, rlen - ((dash+1)-range));
+		if (*from < 0) {
+			*to = INT64_MAX;
+			*parsed = UWSGI_RANGE_PARSED;
+		}
 	}
 }
 
 static int uwsgi_proto_check_10(struct wsgi_request *wsgi_req, char *key, char *buf, uint16_t len) {
 
+	if (uwsgi.honour_range && !uwsgi_proto_key("HTTP_IF_RANGE", 13)) {
+		wsgi_req->if_range = buf;
+		wsgi_req->if_range_len = len;
+	}
+
 	if (uwsgi.honour_range && !uwsgi_proto_key("HTTP_RANGE", 10)) {
-		uwsgi_parse_http_range(buf, len, &wsgi_req->range_from, &wsgi_req->range_to);
+		uwsgi_parse_http_range(buf, len, &wsgi_req->range_parsed,
+				&wsgi_req->range_from, &wsgi_req->range_to);
+		// set deprecated fields for binary compatibility
+		wsgi_req->__range_from = (size_t)wsgi_req->range_from;
+		wsgi_req->__range_to = (size_t)wsgi_req->range_to;
 		return 0;
 	}
 
-	if (!uwsgi_proto_key("UWSGI_FILE", 10)) {
+	if (uwsgi.dynamic_apps && !uwsgi_proto_key("UWSGI_FILE", 10)) {
 		wsgi_req->file = buf;
 		wsgi_req->file_len = len;
 		wsgi_req->dynamic = 1;
 		return 0;
 	}
 
-	if (!uwsgi_proto_key("UWSGI_HOME", 10)) {
+	if (uwsgi.dynamic_apps && !uwsgi_proto_key("UWSGI_HOME", 10)) {
 		wsgi_req->home = buf;
 		wsgi_req->home_len = len;
 		return 0;
@@ -371,14 +399,14 @@ static int uwsgi_proto_check_12(struct wsgi_request *wsgi_req, char *key, char *
 		return 0;
 	}
 
-	if (!uwsgi_proto_key("UWSGI_SCRIPT", 12)) {
+	if (uwsgi.dynamic_apps && !uwsgi_proto_key("UWSGI_SCRIPT", 12)) {
 		wsgi_req->script = buf;
 		wsgi_req->script_len = len;
 		wsgi_req->dynamic = 1;
 		return 0;
 	}
 
-	if (!uwsgi_proto_key("UWSGI_MODULE", 12)) {
+	if (uwsgi.dynamic_apps && !uwsgi_proto_key("UWSGI_MODULE", 12)) {
 		wsgi_req->module = buf;
 		wsgi_req->module_len = len;
 		wsgi_req->dynamic = 1;
@@ -443,7 +471,7 @@ static int uwsgi_proto_check_14(struct wsgi_request *wsgi_req, char *key, char *
 		return 0;
 	}
 
-	if (!uwsgi_proto_key("UWSGI_CALLABLE", 14)) {
+	if (uwsgi.dynamic_apps && !uwsgi_proto_key("UWSGI_CALLABLE", 14)) {
 		wsgi_req->callable = buf;
 		wsgi_req->callable_len = len;
 		wsgi_req->dynamic = 1;
@@ -527,6 +555,17 @@ static int uwsgi_proto_check_22(struct wsgi_request *wsgi_req, char *key, char *
 		return 0;
 	}
 
+	if (!uwsgi_proto_key("HTTP_X_FORWARDED_PROTO", 22)) {
+                wsgi_req->scheme = buf;
+                wsgi_req->scheme_len = len;
+        }
+
+	if (!uwsgi_proto_key("HTTP_TRANSFER_ENCODING", 22)) {
+		if (!uwsgi_strnicmp(buf, len, "chunked", 7)) {
+                	wsgi_req->body_is_chunked = 1;
+		}
+	}
+
 	return 0;
 }
 
@@ -573,7 +612,7 @@ int uwsgi_parse_vars(struct wsgi_request *wsgi_req) {
 	struct uwsgi_dyn_dict *udd;
 
 	ptrbuf = buffer;
-	bufferend = ptrbuf + wsgi_req->uh->pktsize;
+	bufferend = ptrbuf + wsgi_req->len;
 	int i;
 
 	/* set an HTTP 500 status as default */
@@ -710,7 +749,7 @@ next:
 	}
 
 	if (uwsgi.manage_script_name) {
-		if (uwsgi_apps_cnt > 0 && wsgi_req->path_info_len > 1 && wsgi_req->path_info_pos != -1) {
+		if (uwsgi_apps_cnt > 0 && wsgi_req->path_info_len >= 1 && wsgi_req->path_info_pos != -1) {
 			// starts with 1 as the 0 app is the default (/) one
 			int best_found = 0;
 			char *orig_path_info = wsgi_req->path_info;
@@ -731,25 +770,40 @@ next:
 			}
 
 			for (i = 0; i < uwsgi_apps_cnt; i++) {
-				//uwsgi_log("app mountpoint = %.*s\n", uwsgi_apps[i].mountpoint_len, uwsgi_apps[i].mountpoint);
-				if (orig_path_info_len >= uwsgi_apps[i].mountpoint_len) {
-					if (!uwsgi_startswith(orig_path_info, uwsgi_apps[i].mountpoint, uwsgi_apps[i].mountpoint_len) && uwsgi_apps[i].mountpoint_len > best_found) {
-						best_found = uwsgi_apps[i].mountpoint_len;
-						wsgi_req->script_name = uwsgi_apps[i].mountpoint;
-						wsgi_req->script_name_len = uwsgi_apps[i].mountpoint_len;
-						wsgi_req->path_info = orig_path_info + wsgi_req->script_name_len;
-						wsgi_req->path_info_len = orig_path_info_len - wsgi_req->script_name_len;
+				char* mountpoint = uwsgi_apps[i].mountpoint;
+				int mountpoint_len = uwsgi_apps[i].mountpoint_len;
 
-						wsgi_req->hvec[wsgi_req->script_name_pos].iov_base = wsgi_req->script_name;
-						wsgi_req->hvec[wsgi_req->script_name_pos].iov_len = wsgi_req->script_name_len;
-
-						wsgi_req->hvec[wsgi_req->path_info_pos].iov_base = wsgi_req->path_info;
-						wsgi_req->hvec[wsgi_req->path_info_pos].iov_len = wsgi_req->path_info_len;
-#ifdef UWSGI_DEBUG
-						uwsgi_log("managed SCRIPT_NAME = %.*s PATH_INFO = %.*s\n", wsgi_req->script_name_len, wsgi_req->script_name, wsgi_req->path_info_len, wsgi_req->path_info);
-#endif
-					}
+				// Ignore trailing mountpoint slashes
+				if (mountpoint_len > 0 && mountpoint[mountpoint_len - 1] == '/') {
+					mountpoint_len -= 1;
 				}
+
+				//uwsgi_log("app mountpoint = %.*s\n", uwsgi_apps[i].mountpoint_len, uwsgi_apps[i].mountpoint);
+
+				// Check if mountpoint could be a possible candidate
+				if (orig_path_info_len < mountpoint_len || // it should be shorter than or equal to path_info
+					mountpoint_len <= best_found || // it should be better than the previous found
+					// should have the same prefix of path_info
+					uwsgi_startswith(orig_path_info, mountpoint, mountpoint_len) ||
+					// and should not be "misleading"
+					(orig_path_info_len > mountpoint_len && orig_path_info[mountpoint_len] != '/' )) {
+					continue;
+				}
+
+				best_found = mountpoint_len;
+				wsgi_req->script_name = uwsgi_apps[i].mountpoint;
+				wsgi_req->script_name_len = uwsgi_apps[i].mountpoint_len;
+				wsgi_req->path_info = orig_path_info + wsgi_req->script_name_len;
+				wsgi_req->path_info_len = orig_path_info_len - wsgi_req->script_name_len;
+
+				wsgi_req->hvec[wsgi_req->script_name_pos].iov_base = wsgi_req->script_name;
+				wsgi_req->hvec[wsgi_req->script_name_pos].iov_len = wsgi_req->script_name_len;
+
+				wsgi_req->hvec[wsgi_req->path_info_pos].iov_base = wsgi_req->path_info;
+				wsgi_req->hvec[wsgi_req->path_info_pos].iov_len = wsgi_req->path_info_len;
+#ifdef UWSGI_DEBUG
+				uwsgi_log("managed SCRIPT_NAME = %.*s PATH_INFO = %.*s\n", wsgi_req->script_name_len, wsgi_req->script_name, wsgi_req->path_info_len, wsgi_req->path_info);
+#endif
 			}
 		}
 	}
@@ -1030,7 +1084,7 @@ char *uwsgi_req_append(struct wsgi_request *wsgi_req, char *key, uint16_t keylen
 		}
 	}
 
-	if ((wsgi_req->uh->pktsize + (2 + keylen + 2 + vallen)) > uwsgi.buffer_size) {
+	if ((wsgi_req->len + (2 + keylen + 2 + vallen)) > uwsgi.buffer_size) {
 		uwsgi_log("not enough buffer space to add %.*s variable, consider increasing it with the --buffer-size option\n", keylen, key);
 		return NULL;
 	}
@@ -1040,7 +1094,7 @@ char *uwsgi_req_append(struct wsgi_request *wsgi_req, char *key, uint16_t keylen
 		return NULL;
 	}
 
-	char *ptr = wsgi_req->buffer + wsgi_req->uh->pktsize;
+	char *ptr = wsgi_req->buffer + wsgi_req->len;
 
 	*ptr++ = (uint8_t) (keylen & 0xff);
 	*ptr++ = (uint8_t) ((keylen >> 8) & 0xff);
@@ -1051,7 +1105,7 @@ char *uwsgi_req_append(struct wsgi_request *wsgi_req, char *key, uint16_t keylen
 	wsgi_req->var_cnt++;
 	ptr += keylen;
 
-	
+
 
 	*ptr++ = (uint8_t) (vallen & 0xff);
 	*ptr++ = (uint8_t) ((vallen >> 8) & 0xff);
@@ -1061,7 +1115,7 @@ char *uwsgi_req_append(struct wsgi_request *wsgi_req, char *key, uint16_t keylen
         wsgi_req->hvec[wsgi_req->var_cnt].iov_len = vallen;
 	wsgi_req->var_cnt++;
 
-	wsgi_req->uh->pktsize += (2 + keylen + 2 + vallen);
+	wsgi_req->len += (2 + keylen + 2 + vallen);
 
 	return ptr;
 }
@@ -1086,7 +1140,7 @@ int uwsgi_req_append_path_info_with_index(struct wsgi_request *wsgi_req, char *i
 	wsgi_req->path_info_len += need_slash + index_len;
 
 	// 2 + 9 + 2
-	if ((wsgi_req->uh->pktsize + (13 + wsgi_req->path_info_len)) > uwsgi.buffer_size) {
+	if ((wsgi_req->len + (13 + wsgi_req->path_info_len)) > uwsgi.buffer_size) {
                 uwsgi_log("not enough buffer space to transform the PATH_INFO variable, consider increasing it with the --buffer-size option\n");
                 return -1;
         }
@@ -1097,7 +1151,7 @@ int uwsgi_req_append_path_info_with_index(struct wsgi_request *wsgi_req, char *i
         }
 
 	uint16_t keylen = 9;
-	char *ptr = wsgi_req->buffer + wsgi_req->uh->pktsize;
+	char *ptr = wsgi_req->buffer + wsgi_req->len;
 	*ptr++ = (uint8_t) (keylen & 0xff);
         *ptr++ = (uint8_t) ((keylen >> 8) & 0xff);
 
@@ -1118,13 +1172,13 @@ int uwsgi_req_append_path_info_with_index(struct wsgi_request *wsgi_req, char *i
 		*ptr ++= '/';
 	}
 	memcpy(ptr, index, index_len);
-	
+
 	wsgi_req->hvec[wsgi_req->var_cnt].iov_base = new_path_info;
         wsgi_req->hvec[wsgi_req->var_cnt].iov_len = wsgi_req->path_info_len;
         wsgi_req->var_cnt++;
 
-	wsgi_req->uh->pktsize += 13 + wsgi_req->path_info_len;
+	wsgi_req->len += 13 + wsgi_req->path_info_len;
 	wsgi_req->path_info = new_path_info;
-	
+
 	return 0;
 }

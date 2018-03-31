@@ -2,9 +2,7 @@
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 
-#if defined(__linux__)
-#include <attr/xattr.h>
-#elif defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__)
 #include <sys/xattr.h>
 #endif
 
@@ -449,7 +447,7 @@ static int uwsgi_webdav_add_props(struct wsgi_request *wsgi_req, xmlNode *req_pr
 #elif defined(__APPLE__)
 					ssize_t rlen2 = getxattr(filename, key, NULL, 0, 0, 0);
 #endif
-					if (rlen > 0) {
+					if (rlen2 > 0) {
 						// leave space for final 0
 						char *xvalue = uwsgi_calloc(rlen2 + 1);
 #if defined(__linux__)
@@ -461,7 +459,7 @@ static int uwsgi_webdav_add_props(struct wsgi_request *wsgi_req, xmlNode *req_pr
 						}
 						free(xvalue);	
 					}
-					else if (rlen == 0) {
+					else if (rlen2 == 0) {
 						xattr_item = xmlNewTextChild(r_prop, NULL, BAD_CAST xattr_key, NULL);
 					}
 				}
@@ -766,6 +764,7 @@ static int uwsgi_wevdav_manage_proppatch(struct wsgi_request *wsgi_req, xmlDoc *
         encoded_uri[uri_len] = 0;
         xmlNewChild(response, dav_ns, BAD_CAST "href", BAD_CAST encoded_uri);
         free(encoded_uri);
+        free(uri);
 
         // propfind can be "set" or "remove"
         xmlNode *node;
@@ -989,7 +988,7 @@ next:
                 struct dirent de;
                 if (readdir_r(d, &de, &de_r)) goto end;
                 if (de_r == NULL) break;
-		// skip items startign with a dot
+		// skip items starting with a dot
 		if (de.d_name[0] == '.') continue;
 		if (uwsgi_webdav_dirlist_add_item(ub, de.d_name, strlen(de.d_name), de.d_type == DT_DIR ? 1 : 0)) goto end;
         }

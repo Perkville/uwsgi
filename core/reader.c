@@ -5,11 +5,20 @@ extern struct uwsgi_server uwsgi;
 int uwsgi_simple_wait_read_hook(int fd, int timeout) {
 	struct pollfd upoll;
 	timeout = timeout * 1000;
+        int ret = 0;
 
         upoll.fd = fd;
         upoll.events = POLLIN;
         upoll.revents = 0;
-        int ret = poll(&upoll, 1, timeout);
+        for(;;) {
+            ret = poll(&upoll, 1, timeout);
+            if ((ret < 0) && (errno == EINTR)){
+                continue;
+            }
+            else {
+                break;
+            }
+        }
 
         if (ret > 0) {
                 if (upoll.revents & POLLIN) {
@@ -477,7 +486,7 @@ int uwsgi_postbuffer_do_in_mem(struct wsgi_request *wsgi_req) {
 
         while (remains > 0) {
                 if (uwsgi.harakiri_options.workers > 0) {
-                        inc_harakiri(uwsgi.harakiri_options.workers);
+                        inc_harakiri(wsgi_req, uwsgi.harakiri_options.workers);
                 }
 
                 ssize_t rlen = wsgi_req->socket->proto_read_body(wsgi_req, ptr, remains);
@@ -551,7 +560,7 @@ int uwsgi_postbuffer_do_in_disk(struct wsgi_request *wsgi_req) {
 
                 // during post buffering we need to constantly reset the harakiri
                 if (uwsgi.harakiri_options.workers > 0) {
-                        inc_harakiri(uwsgi.harakiri_options.workers);
+                        inc_harakiri(wsgi_req, uwsgi.harakiri_options.workers);
                 }
 
                 // we use the already available post buffering buffer to read chunks....

@@ -91,37 +91,52 @@ struct uwsgi_buffer *uwsgi_python_backtrace(struct wsgi_request *wsgi_req) {
 		PyObject *tb_text = PyTuple_GetItem(t, 3);
 
 		int64_t line_no = PyInt_AsLong(tb_lineno);
-
 #ifdef PYTHREE
-		PyObject *zero = PyUnicode_AsUTF8String(tb_filename);
-		if (!zero) goto end0;
+		PyObject *zero = NULL;
+		if (tb_filename) {
+			zero = PyUnicode_AsUTF8String(tb_filename);
+			if (!zero) goto end0;
 
-		// filename
-                if (uwsgi_buffer_u16le(ub, PyString_Size(zero))) { Py_DECREF(zero); goto end0; }
-                if (uwsgi_buffer_append(ub, PyString_AsString(zero), PyString_Size(zero))) { Py_DECREF(zero); goto end0; }
+			// filename
+                	if (uwsgi_buffer_u16le(ub, PyString_Size(zero))) { Py_DECREF(zero); goto end0; }
+                	if (uwsgi_buffer_append(ub, PyString_AsString(zero), PyString_Size(zero))) { Py_DECREF(zero); goto end0; }
 
-		Py_DECREF(zero);
+			Py_DECREF(zero);
+		}
+		else {
+                	if (uwsgi_buffer_u16le(ub, 0)) { goto end0; }
+		}
 
                 // lineno
                 if (uwsgi_buffer_append_valnum(ub, line_no)) goto end0;
 
-		zero = PyUnicode_AsUTF8String(tb_function);
-                if (!zero) goto end0;
+		if (tb_function) {
+			zero = PyUnicode_AsUTF8String(tb_function);
+                	if (!zero) goto end0;
 
-                // function
-                if (uwsgi_buffer_u16le(ub, PyString_Size(zero))) { Py_DECREF(zero); goto end0; }
-                if (uwsgi_buffer_append(ub, PyString_AsString(zero), PyString_Size(zero))) { Py_DECREF(zero); goto end0; }
+                	// function
+                	if (uwsgi_buffer_u16le(ub, PyString_Size(zero))) { Py_DECREF(zero); goto end0; }
+                	if (uwsgi_buffer_append(ub, PyString_AsString(zero), PyString_Size(zero))) { Py_DECREF(zero); goto end0; }
+			Py_DECREF(zero);
+		}
+		else {
+                	if (uwsgi_buffer_u16le(ub, 0)) { goto end0; }
+		}
 
-		Py_DECREF(zero);
 
-		zero = PyUnicode_AsUTF8String(tb_text);
-                if (!zero) goto end0;
+		if (tb_text) {
+			zero = PyUnicode_AsUTF8String(tb_text);
+                	if (!zero) goto end0;
 
-                // text
-                if (uwsgi_buffer_u16le(ub, PyString_Size(zero))) { Py_DECREF(zero); goto end0; }
-                if (uwsgi_buffer_append(ub, PyString_AsString(zero), PyString_Size(zero))) { Py_DECREF(zero); goto end0; }
+                	// text
+                	if (uwsgi_buffer_u16le(ub, PyString_Size(zero))) { Py_DECREF(zero); goto end0; }
+                	if (uwsgi_buffer_append(ub, PyString_AsString(zero), PyString_Size(zero))) { Py_DECREF(zero); goto end0; }
 
-		Py_DECREF(zero);
+			Py_DECREF(zero);
+		}
+		else {
+                	if (uwsgi_buffer_u16le(ub, 0)) { goto end0; }
+		}
 		
 #else
 		// filename
@@ -289,7 +304,7 @@ int uwsgi_python_call(struct wsgi_request *wsgi_req, PyObject *callable, PyObjec
 
 	if (wsgi_req->async_result) {
 		while ( manage_python_response(wsgi_req) != UWSGI_OK) {
-			if (uwsgi.async > 1) {
+			if (uwsgi.async > 0) {
 				return UWSGI_AGAIN;
 			}
 		}

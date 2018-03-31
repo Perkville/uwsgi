@@ -168,9 +168,19 @@ void *uwsgi_request_subhandler_wsgi(struct wsgi_request *wsgi_req, struct uwsgi_
 
         PyDict_SetItemString(wsgi_req->async_environ, "wsgi.input", wsgi_req->async_input);
 
-	PyDict_SetItemString(wsgi_req->async_environ, "wsgi.file_wrapper", wi->sendfile);
+	if (up.wsgi_manage_chunked_input) {
+		if (wsgi_req->body_is_chunked) {
+			PyDict_SetItemString(wsgi_req->async_environ, "wsgi.input_terminated", Py_True);
+		}
+		else {
+			PyDict_SetItemString(wsgi_req->async_environ, "wsgi.input_terminated", Py_False);
+		}
+	}
 
-	if (uwsgi.async > 1) {
+	if (!up.wsgi_disable_file_wrapper)
+		PyDict_SetItemString(wsgi_req->async_environ, "wsgi.file_wrapper", wi->sendfile);
+
+	if (uwsgi.async > 0) {
 		PyDict_SetItemString(wsgi_req->async_environ, "x-wsgiorg.fdevent.readable", wi->eventfd_read);
 		PyDict_SetItemString(wsgi_req->async_environ, "x-wsgiorg.fdevent.writable", wi->eventfd_write);
 		PyDict_SetItemString(wsgi_req->async_environ, "x-wsgiorg.fdevent.timeout", Py_None);
@@ -233,7 +243,12 @@ void *uwsgi_request_subhandler_wsgi(struct wsgi_request *wsgi_req, struct uwsgi_
 	PyDict_SetItemString(wsgi_req->async_environ, "uwsgi.node", wi->uwsgi_node);
 
 	// call
-	PyTuple_SetItem(wsgi_req->async_args, 0, wsgi_req->async_environ);
+	if (PyTuple_GetItem(wsgi_req->async_args, 0) != wsgi_req->async_environ) {
+	    if (PyTuple_SetItem(wsgi_req->async_args, 0, wsgi_req->async_environ)) {
+	        uwsgi_log_verbose("unable to set environ to the python application callable, consider using the holy env allocator\n");
+	        return NULL;
+	    }
+	}
 	return python_call(wsgi_req->async_app, wsgi_req->async_args, uwsgi.catch_exceptions, wsgi_req);
 }
 
@@ -269,7 +284,7 @@ int uwsgi_response_subhandler_wsgi(struct wsgi_request *wsgi_req) {
 		if (!wsgi_req->async_placeholder) {
 			goto exception;
 		}
-		if (uwsgi.async > 1) {
+		if (uwsgi.async > 0) {
 			return UWSGI_AGAIN;
 		}
 	}

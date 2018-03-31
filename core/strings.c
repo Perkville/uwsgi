@@ -3,30 +3,30 @@
 char *uwsgi_str_split_nget(char *str, size_t len, char what, size_t pos, size_t *rlen) {
 	size_t i;
 	size_t current = 0;
-	char *choosen = str;
-	size_t choosen_len = 0;
+	char *chosen = str;
+	size_t chosen_len = 0;
 	*rlen = 0;
 	for(i=0;i<len;i++) {
-		if (!choosen) choosen = str + i;
+		if (!chosen) chosen = str + i;
 		if (str[i] == what) {
 			if (current == pos) {
-				if (choosen_len == 0) return NULL;
-				*rlen = choosen_len;
-				return choosen;
+				if (chosen_len == 0) return NULL;
+				*rlen = chosen_len;
+				return chosen;
 			}
 			current++;
-			choosen = NULL;
-			choosen_len = 0;
+			chosen = NULL;
+			chosen_len = 0;
 		}
 		else {
-			choosen_len ++;
+			chosen_len ++;
 		}
 	}
 
 	if (current == pos) {
-		if (choosen_len == 0) return NULL;
-		*rlen = choosen_len;
-		return choosen;
+		if (chosen_len == 0) return NULL;
+		*rlen = chosen_len;
+		return chosen;
 	}
 
 	return NULL;
@@ -65,16 +65,9 @@ char *uwsgi_lower(char *str, size_t size) {
         return str;
 }
 
-// check if a string is contained in another one
+// check if a char is contained in a string
 char *uwsgi_str_contains(char *str, int slen, char what) {
-
-        int i;
-        for (i = 0; i < slen; i++) {
-                if (str[i] == what) {
-                        return str + i;
-                }
-        }
-        return NULL;
+        return memchr(str, what, slen);
 }
 
 int uwsgi_contains_n(char *s1, size_t s1_len, char *s2, size_t s2_len) {
@@ -126,15 +119,7 @@ int uwsgi_starts_with(char *src, int slen, char *dst, int dlen) {
 
 // unsized check
 int uwsgi_startswith(char *src, char *what, int wlen) {
-
-        int i;
-
-        for (i = 0; i < wlen; i++) {
-                if (src[i] != what[i])
-                        return -1;
-        }
-
-        return 0;
+        return memcmp(what, src, wlen);
 }
 
 // concatenate strings
@@ -483,3 +468,22 @@ char ** uwsgi_split_quoted(char *what, size_t what_len, char *sep, size_t *rlen)
 
 	return ret;
 }
+
+char *uwsgi_get_last_char(char *what, char c) {
+	return strrchr(what, c);
+}
+
+// Note by Mathieu Dupuy: memrchr here is better, unfortunately it is not supported
+// everywhere. The only safe option looks checking for Linux :(
+char *uwsgi_get_last_charn(char *what, size_t len, char c) {
+#if defined(__linux__)
+	return memrchr(what, c, len);
+#else
+        while (len--) {
+                if (what[len] == c)
+                        return what + len;
+        }
+        return NULL;
+#endif
+}
+

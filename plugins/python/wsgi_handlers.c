@@ -62,7 +62,19 @@ static PyObject *uwsgi_Input_read(uwsgi_Input *self, PyObject *args) {
 	ssize_t rlen = 0;
 
 	UWSGI_RELEASE_GIL
-	char *buf = uwsgi_request_body_read(wsgi_req, arg_len, &rlen);
+	char *buf = NULL;
+	if (wsgi_req->body_is_chunked && up.wsgi_manage_chunked_input) {
+		struct uwsgi_buffer *ubuf = uwsgi_chunked_read_smart(wsgi_req, arg_len, uwsgi.socket_timeout);
+		if (!ubuf) {
+       			return PyErr_Format(PyExc_IOError, "error during chunked read(%ld) on wsgi.input", arg_len);
+		}
+		PyObject *ret = PyString_FromStringAndSize(ubuf->buf, ubuf->pos);
+		uwsgi_buffer_destroy(ubuf);
+		return ret;
+	}
+	else {
+		buf = uwsgi_request_body_read(wsgi_req, arg_len, &rlen);
+	}
 	UWSGI_GET_GIL
 	if (buf == uwsgi.empty) {
 		return PyString_FromString("");
@@ -326,7 +338,7 @@ int uwsgi_request_wsgi(struct wsgi_request *wsgi_req) {
 	}
 
 	/* Standard WSGI request */
-	if (!wsgi_req->uh->pktsize) {
+	if (!wsgi_req->len) {
 		uwsgi_log( "Empty python request. skip.\n");
 		return -1;
 	}
@@ -339,6 +351,7 @@ int uwsgi_request_wsgi(struct wsgi_request *wsgi_req) {
         	// this part must be heavy locked in threaded modes
                 if (uwsgi.threads > 1) {
                 	pthread_mutex_lock(&up.lock_pyloaders);
+			up.is_dynamically_loading_an_app = 1;
                 }
 	}
 
@@ -363,6 +376,7 @@ int uwsgi_request_wsgi(struct wsgi_request *wsgi_req) {
 
 	if (wsgi_req->dynamic) {
 		if (uwsgi.threads > 1) {
+			up.is_dynamically_loading_an_app = 0;
 			pthread_mutex_unlock(&up.lock_pyloaders);
 		}
 	}
@@ -405,7 +419,7 @@ int uwsgi_request_wsgi(struct wsgi_request *wsgi_req) {
 
 
 		while (wi->response_subhandler(wsgi_req) != UWSGI_OK) {
-			if (uwsgi.async > 1) {
+			if (uwsgi.async > 0) {
 				UWSGI_RELEASE_GIL
 				wsgi_req->async_force_again = 1;
 				return UWSGI_AGAIN;
@@ -442,8 +456,8 @@ void uwsgi_after_request_wsgi(struct wsgi_request *wsgi_req) {
 	if (up.after_req_hook) {
 		if (uwsgi.harakiri_no_arh) {
 			// leave harakiri mode
-        		if (uwsgi.workers[uwsgi.mywid].harakiri > 0)
-                		set_harakiri(0);
+        		if (uwsgi.workers[uwsgi.mywid].cores[wsgi_req->async_id].harakiri > 0)
+                		set_harakiri(wsgi_req, 0);
 		}
 		UWSGI_GET_GIL
 		PyObject *arh = python_call(up.after_req_hook, up.after_req_hook_args, 0, NULL);

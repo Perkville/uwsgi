@@ -86,9 +86,11 @@ XS(XS_signal) {
 XS(XS_set_user_harakiri) {
         dXSARGS;
 
+	struct wsgi_request *wsgi_req = current_wsgi_req();
+
         psgi_check_args(1);
 
-	set_user_harakiri( SvIV(ST(0)) );
+	set_user_harakiri(wsgi_req, SvIV(ST(0)) );
 
         XSRETURN_UNDEF;
 }
@@ -122,7 +124,7 @@ XS(XS_cache_set) {
 	if (items > 2) {
 		expires = SvIV(ST(2));
 		if (items > 3) {
-			cache = SvPV_nolen(ST(1));
+			cache = SvPV_nolen(ST(3));
 		}
 	}
 
@@ -211,7 +213,7 @@ XS(XS_cache_clear) {
         char *cache = NULL;
         psgi_check_args(1);
 
-        cache = SvPV_nolen(ST(1));
+        cache = SvPV_nolen(ST(0));
 
         if (!uwsgi_cache_magic_clear(cache)) {
                 XSRETURN_YES;
@@ -316,6 +318,13 @@ XS(XS_alarm) {
 	uwsgi_alarm_trigger(alarm, msg, msg_len);
 
         XSRETURN_UNDEF;
+}
+
+XS(XS_worker_id) {
+	dXSARGS;
+        psgi_check_args(0);
+	ST(0) = newSViv(uwsgi.mywid);	
+	XSRETURN(1);
 }
 
 XS(XS_async_connect) {
@@ -430,10 +439,10 @@ XS(XS_signal_wait) {
         wsgi_req->signal_received = -1;
 
 	if (items > 0) {
-                received_signal = uwsgi_signal_wait(SvIV(ST(0)));
+                received_signal = uwsgi_signal_wait(wsgi_req, SvIV(ST(0)));
         }
         else {
-                received_signal = uwsgi_signal_wait(-1);
+                received_signal = uwsgi_signal_wait(wsgi_req, -1);
         }
 
         if (received_signal < 0) {
@@ -979,6 +988,44 @@ XS(XS_add_var) {
 	
 }
 
+XS(XS_set_logvar) {
+	dXSARGS;
+	psgi_check_args(2);
+
+	struct wsgi_request *wsgi_req = current_wsgi_req();
+
+	STRLEN keylen;
+	char *key = SvPV(ST(0), keylen);
+
+	STRLEN vallen;
+	char *val = SvPV(ST(1), vallen);
+
+	uwsgi_logvar_add(wsgi_req, key, keylen, val, vallen);
+
+	XSRETURN_UNDEF;
+}
+
+XS(XS_get_logvar) {
+	dXSARGS;
+	psgi_check_args(1);
+
+	struct wsgi_request *wsgi_req = current_wsgi_req();
+
+	STRLEN keylen;
+	char *key = SvPV(ST(0), keylen);
+
+	struct uwsgi_logvar *lv = uwsgi_logvar_get(wsgi_req, key, keylen);
+
+	if (lv) {
+		ST(0) = newSVpv(lv->val, lv->vallen);
+		sv_2mortal(ST(0));
+		XSRETURN(1);
+	}
+
+	XSRETURN_UNDEF;
+
+}
+
 void init_perl_embedded_module() {
 	psgi_xs(reload);
 
@@ -1042,5 +1089,8 @@ void init_perl_embedded_module() {
 	psgi_xs(spool);
 
 	psgi_xs(add_var);
+	psgi_xs(worker_id);
 	
+	psgi_xs(set_logvar);
+	psgi_xs(get_logvar);
 }

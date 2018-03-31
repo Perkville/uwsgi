@@ -4,6 +4,8 @@ extern struct uwsgi_server uwsgi;
 
 static sapi_module_struct uwsgi_sapi_module;
 
+static int uwsgi_php_init(void);
+
 struct uwsgi_php {
 	struct uwsgi_string_list *allowed_docroot;
 	struct uwsgi_string_list *allowed_ext;
@@ -15,10 +17,13 @@ struct uwsgi_php {
 	struct uwsgi_regexp_list *app_bypass;
 #endif
 	struct uwsgi_string_list *vars;
+	struct uwsgi_string_list *constants;
 	char *docroot;
 	char *app;
 	char *app_qs;
 	char *fallback;
+	char *fallback2;
+	char *fallback_qs;
 	size_t ini_size;
 	int dump_config;
 	char *server_software;
@@ -28,11 +33,17 @@ struct uwsgi_php {
 	struct uwsgi_string_list *exec_after;
 
 	char *sapi_name;
+
+	int sapi_initialized;
 } uphp;
 
 void uwsgi_opt_php_ini(char *opt, char *value, void *foobar) {
 	uwsgi_sapi_module.php_ini_path_override = uwsgi_str(value);
         uwsgi_sapi_module.php_ini_ignore = 1;
+}
+
+void uwsgi_opt_early_php(char *opt, char *value, void *foobar) {
+	uwsgi_php_init();
 }
 
 struct uwsgi_option uwsgi_php_options[] = {
@@ -50,22 +61,32 @@ struct uwsgi_option uwsgi_php_options[] = {
         {"php-server-software", required_argument, 0, "force php SERVER_SOFTWARE", uwsgi_opt_set_str, &uphp.server_software, 0},
         {"php-app", required_argument, 0, "force the php file to run at each request", uwsgi_opt_set_str, &uphp.app, 0},
         {"php-app-qs", required_argument, 0, "when in app mode force QUERY_STRING to the specified value + REQUEST_URI", uwsgi_opt_set_str, &uphp.app_qs, 0},
-        {"php-fallback", required_argument, 0, "run the specified php script when the request one does not exist", uwsgi_opt_set_str, &uphp.fallback, 0},
+        {"php-fallback", required_argument, 0, "run the specified php script when the requested one does not exist", uwsgi_opt_set_str, &uphp.fallback, 0},
+        {"php-fallback2", required_argument, 0, "run the specified php script relative to the document root when the requested one does not exist", uwsgi_opt_set_str, &uphp.fallback2, 0},
+        {"php-fallback-qs", required_argument, 0, "php-fallback with QUERY_STRING set", uwsgi_opt_set_str, &uphp.fallback_qs, 0},
 #ifdef UWSGI_PCRE
         {"php-app-bypass", required_argument, 0, "if the regexp matches the uri the --php-app is bypassed", uwsgi_opt_add_regexp_list, &uphp.app_bypass, 0},
 #endif
         {"php-var", required_argument, 0, "add/overwrite a CGI variable at each request", uwsgi_opt_add_string_list, &uphp.vars, 0},
+        {"php-constant", required_argument, 0, "define a php constant for each request", uwsgi_opt_add_string_list, &uphp.constants, 0},
         {"php-dump-config", no_argument, 0, "dump php config (if modified via --php-set or append options)", uwsgi_opt_true, &uphp.dump_config, 0},
         {"php-exec-before", required_argument, 0, "run specified php code before the requested script", uwsgi_opt_add_string_list, &uphp.exec_before, 0},
         {"php-exec-begin", required_argument, 0, "run specified php code before the requested script", uwsgi_opt_add_string_list, &uphp.exec_before, 0},
         {"php-exec-after", required_argument, 0, "run specified php code after the requested script", uwsgi_opt_add_string_list, &uphp.exec_after, 0},
         {"php-exec-end", required_argument, 0, "run specified php code after the requested script", uwsgi_opt_add_string_list, &uphp.exec_after, 0},
         {"php-sapi-name", required_argument, 0, "hack the sapi name (required for enabling zend opcode cache)", uwsgi_opt_set_str, &uphp.sapi_name, 0},
+
+        {"early-php", no_argument, 0, "initialize an early perl interpreter shared by all loaders", uwsgi_opt_early_php, NULL, UWSGI_OPT_IMMEDIATE},
+        {"early-php-sapi-name", required_argument, 0, "hack the sapi name (required for enabling zend opcode cache)", uwsgi_opt_set_str, &uphp.sapi_name, UWSGI_OPT_IMMEDIATE},
 	UWSGI_END_OF_OPTIONS
 };
 
 
+#ifdef UWSGI_PHP7
+static size_t sapi_uwsgi_ub_write(const char *str, size_t str_length TSRMLS_DC)
+#else
 static int sapi_uwsgi_ub_write(const char *str, uint str_length TSRMLS_DC)
+#endif
 {
 	struct wsgi_request *wsgi_req = (struct wsgi_request *) SG(server_context);
 
@@ -77,7 +98,7 @@ static int sapi_uwsgi_ub_write(const char *str, uint str_length TSRMLS_DC)
 	return str_length;
 }
 
-static int sapi_uwsgi_send_headers(sapi_headers_struct *sapi_headers)
+static int sapi_uwsgi_send_headers(sapi_headers_struct *sapi_headers TSRMLS_DC)
 {
 	sapi_header_struct *h;
 	zend_llist_position pos;
@@ -111,7 +132,11 @@ static int sapi_uwsgi_send_headers(sapi_headers_struct *sapi_headers)
 	return SAPI_HEADER_SENT_SUCCESSFULLY;
 }
 
+#ifdef UWSGI_PHP7
+static size_t sapi_uwsgi_read_post(char *buffer, size_t count_bytes TSRMLS_DC)
+#else
 static int sapi_uwsgi_read_post(char *buffer, uint count_bytes TSRMLS_DC)
+#endif
 {
 	uint read_bytes = 0;
 	
@@ -135,7 +160,7 @@ static int sapi_uwsgi_read_post(char *buffer, uint count_bytes TSRMLS_DC)
 }
 
 
-static char *sapi_uwsgi_read_cookies(void)
+static char *sapi_uwsgi_read_cookies(TSRMLS_D)
 {
 	uint16_t len = 0;
 	struct wsgi_request *wsgi_req = (struct wsgi_request *) SG(server_context);
@@ -200,8 +225,6 @@ static void sapi_uwsgi_register_variables(zval *track_vars_array TSRMLS_DC)
 		}
 		usl = usl->next;
 	}
-
-
 }
 
 static sapi_module_struct uwsgi_sapi_module;
@@ -231,11 +254,30 @@ void uwsgi_php_set(char *opt) {
 extern ps_module ps_mod_uwsgi;
 PHP_MINIT_FUNCTION(uwsgi_php_minit) {
 	php_session_register_module(&ps_mod_uwsgi);
+	struct uwsgi_string_list *usl = uphp.constants;
+	while(usl) {
+		char *equal = strchr(usl->value, '=');
+		if (equal) {
+			size_t name_len = equal - usl->value;
+			char *name = usl->value;
+			char *strval = equal + 1;
+			equal = NULL;
+#ifndef UWSGI_PHP7
+			name_len = name_len + 1;
+#endif
+			zend_register_string_constant(name, name_len, strval, CONST_CS | CONST_PERSISTENT, module_number TSRMLS_CC);
+		}
+		usl = usl->next;
+	}
 	return SUCCESS;
 }
 
 PHP_FUNCTION(uwsgi_version) {
+#ifdef UWSGI_PHP7
+	RETURN_STRING(UWSGI_VERSION);
+#else
 	RETURN_STRING(UWSGI_VERSION, 1);
+#endif
 }
 
 PHP_FUNCTION(uwsgi_worker_id) {
@@ -321,7 +363,11 @@ PHP_FUNCTION(uwsgi_cache_get) {
 	if (value) {
 		char *ret = estrndup(value, valsize);
 		free(value);
+#ifdef UWSGI_PHP7
+		RETURN_STRING(ret);
+#else
 		RETURN_STRING(ret, 0);
+#endif
 	}
 	RETURN_NULL();
 }
@@ -425,7 +471,11 @@ PHP_FUNCTION(uwsgi_rpc) {
 		// here we do not free varargs for performance reasons
 		char *ret = estrndup(response, size);
 		free(response);
+#ifdef UWSGI_PHP7
+		RETURN_STRING(ret);
+#else
 		RETURN_STRING(ret, 0);
+#endif
         }
 
 clear:
@@ -518,8 +568,11 @@ static int php_uwsgi_startup(sapi_module_struct *sapi_module)
 	}
 }
 
-static void sapi_uwsgi_log_message(char *message) {
-
+#if ((PHP_MAJOR_VERSION >= 7) && (PHP_MINOR_VERSION >= 1))
+static void sapi_uwsgi_log_message(char *message, int syslog_type_int) {
+#else
+static void sapi_uwsgi_log_message(char *message TSRMLS_DC) {
+#endif
 	uwsgi_log("%s\n", message);
 }
 
@@ -554,12 +607,18 @@ static sapi_module_struct uwsgi_sapi_module = {
 	STANDARD_SAPI_MODULE_PROPERTIES
 };
 
-int uwsgi_php_init(void) {
+static int uwsgi_php_init(void) {
 
 	struct uwsgi_string_list *pset = uphp.set;
 	struct uwsgi_string_list *append_config = uphp.append_config;
 
-	sapi_startup(&uwsgi_sapi_module);
+	if (!uphp.sapi_initialized) {
+#ifdef ZTS
+        	tsrm_startup(1, 1, 0, NULL);
+#endif
+		sapi_startup(&uwsgi_sapi_module);
+		uphp.sapi_initialized = 1;
+	}
 
 	// applying custom options
 	while(append_config) {
@@ -590,6 +649,7 @@ int uwsgi_php_init(void) {
 	if (uphp.sapi_name) {
 		uwsgi_sapi_module.name = uphp.sapi_name;
 	}
+
 	uwsgi_sapi_module.startup(&uwsgi_sapi_module);
 	uwsgi_log("PHP %s initialized\n", PHP_VERSION);
 
@@ -644,6 +704,9 @@ int uwsgi_php_walk(struct wsgi_request *wsgi_req, char *full_path, char *docroot
         if (part < wsgi_req->path_info+wsgi_req->path_info_len) {
                 memcpy(dst, part, part_size-1);
                 *(dst+part_size-1) = 0;
+                if (stat(full_path, &st)) {
+                        return -1;
+                }
         }
 
         return 0;
@@ -659,8 +722,13 @@ int uwsgi_php_request(struct wsgi_request *wsgi_req) {
 	size_t real_filename_len = 0;
 	struct stat php_stat;
 	char *filename = NULL;
+	int force_empty_script_name = 0;
 
 	zend_file_handle file_handle;
+
+#ifdef ZTS
+	TSRMLS_FETCH();
+#endif
 
 	SG(server_context) = (void *) wsgi_req;
 
@@ -703,7 +771,8 @@ int uwsgi_php_request(struct wsgi_request *wsgi_req) {
                 }
 #endif
 
-		strcpy(real_filename, uphp.app);	
+		strncpy(real_filename, uphp.app, PATH_MAX);
+		real_filename[PATH_MAX-1] = '\0';
 		if (wsgi_req->path_info_len == 1 && wsgi_req->path_info[0] == '/') {
 			goto appready;
 		}
@@ -727,6 +796,7 @@ int uwsgi_php_request(struct wsgi_request *wsgi_req) {
 appready:
 		wsgi_req->path_info = "";
 		wsgi_req->path_info_len = 0;
+		force_empty_script_name = 1;
 		goto secure2;
 	}
 
@@ -738,8 +808,36 @@ oldstyle:
 
 	if (uwsgi_php_walk(wsgi_req, filename, wsgi_req->document_root, wsgi_req->document_root_len, &path_info)) {
 		free(filename);
-		if (uphp.fallback) {
-			filename = uwsgi_str(uphp.fallback);
+
+		if (uphp.fallback || uphp.fallback2) {
+			if (uphp.fallback) {
+				filename = uwsgi_str(uphp.fallback);
+			} else {
+				filename = uwsgi_concat2n(wsgi_req->document_root, strlen(wsgi_req->document_root),
+						uphp.fallback2, strlen(uphp.fallback2));
+				wsgi_req->script_name = uphp.fallback2;
+				wsgi_req->script_name_len = strlen(uphp.fallback2);
+			}
+
+			if (uphp.fallback_qs) {
+				size_t fqs_len = strlen(uphp.fallback_qs);
+				size_t new_qs_len = orig_path_info_len
+					+ fqs_len + 1
+					+ wsgi_req->query_string_len;
+				char *new_qs = ecalloc(1, new_qs_len + 1);
+
+				memcpy(new_qs, uphp.fallback_qs, fqs_len);
+				new_qs[fqs_len] = '=';
+				memcpy(new_qs + fqs_len + 1, orig_path_info, orig_path_info_len);
+				if (wsgi_req->query_string_len) {
+					new_qs[fqs_len + 1 + orig_path_info_len] = '&';
+					memcpy(new_qs + fqs_len + 2 + orig_path_info_len,
+						wsgi_req->query_string, wsgi_req->query_string_len);
+				}
+
+				wsgi_req->query_string = new_qs;
+				wsgi_req->query_string_len = new_qs_len;
+			}
 		}
 		else {
 			uwsgi_404(wsgi_req);
@@ -856,13 +954,19 @@ secure2:
         }
 
 secure3:
-	wsgi_req->script_name = orig_path_info;
-	if (path_info) {
-		wsgi_req->script_name_len = path_info - orig_path_info;
+	if (force_empty_script_name) {
+		wsgi_req->script_name = "";
+		wsgi_req->script_name_len = 0;
 	}
-	else {
-		wsgi_req->script_name_len = orig_path_info_len;
-	}	
+	else if (!uphp.fallback2) {
+		wsgi_req->script_name = orig_path_info;
+		if (path_info) {
+			wsgi_req->script_name_len = path_info - orig_path_info;
+		}
+		else {
+			wsgi_req->script_name_len = orig_path_info_len;
+		}
+	}
 
 #ifdef UWSGI_DEBUG
 	uwsgi_log("php filename = %s script_name = %.*s (%d) document_root = %.*s (%d)\n", real_filename, wsgi_req->script_name_len, wsgi_req->script_name, wsgi_req->script_name_len,

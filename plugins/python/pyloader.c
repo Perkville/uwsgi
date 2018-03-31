@@ -288,10 +288,12 @@ int init_uwsgi_app(int loader, void *arg1, struct wsgi_request *wsgi_req, PyThre
 			uwsgi_log("unable to allocate new tuple for app args\n");
 			exit(1);
 		}
+		Py_INCREF(Py_None);
+		PyTuple_SetItem(wi->args[i], 0, Py_None);
 
 		// add start_response on WSGI app
-		Py_INCREF((PyObject *)up.wsgi_spitout);
 		if (app_type == PYTHON_APP_TYPE_WSGI) {
+			Py_INCREF((PyObject *)up.wsgi_spitout);
 			if (PyTuple_SetItem(wi->args[i], 1, up.wsgi_spitout)) {
 				uwsgi_log("unable to set start_response in args tuple\n");
 				exit(1);
@@ -399,6 +401,13 @@ multiapp:
 
 	// emulate COW
 	uwsgi_emulate_cow_for_apps(id);
+
+	// spawn new auto-reloader thread, if an additional interpreter was started
+        if (up.auto_reload && interpreter == NULL && id) {
+                pthread_t par_tid;
+                pthread_create(&par_tid, NULL, uwsgi_python_autoreloader_thread,
+                        ((PyThreadState *) wi->interpreter)->interp);
+        }
 
 	return id;
 
@@ -602,12 +611,12 @@ PyObject *uwsgi_file_loader(void *arg1) {
 		Py_DECREF(wsgi_file_dict);
 		Py_DECREF(wsgi_file_module);
                 free(py_filename);
-		uwsgi_log( "unable to find \"application\" callable in file %s\n", filename);
+		uwsgi_log( "unable to find \"%s\" callable in file %s\n", callable, filename);
 		return NULL;
 	}
 
 	if (!PyFunction_Check(wsgi_file_callable) && !PyCallable_Check(wsgi_file_callable)) {
-		uwsgi_log( "\"application\" must be a callable object in file %s\n", filename);
+		uwsgi_log( "\"%s\" must be a callable object in file %s\n", callable, filename);
 		Py_DECREF(wsgi_file_callable);
 		Py_DECREF(wsgi_file_dict);
 		Py_DECREF(wsgi_file_module);
@@ -711,7 +720,11 @@ PyObject *uwsgi_paste_loader(void *arg1) {
 		exit(UWSGI_FAILED_APP_CODE);
 	}
 
-	paste_arg = PyTuple_New(1);
+	if (up.paste_name) {
+		paste_arg = PyTuple_New(2);
+	} else {
+		paste_arg = PyTuple_New(1);
+	}
 	if (!paste_arg) {
 		PyErr_Print();
 		exit(UWSGI_FAILED_APP_CODE);
@@ -720,6 +733,13 @@ PyObject *uwsgi_paste_loader(void *arg1) {
 	if (PyTuple_SetItem(paste_arg, 0, UWSGI_PYFROMSTRING(paste))) {
 		PyErr_Print();
 		exit(UWSGI_FAILED_APP_CODE);
+	}
+
+	if (up.paste_name) {
+		if (PyTuple_SetItem(paste_arg, 1, UWSGI_PYFROMSTRING(up.paste_name))) {
+			PyErr_Print();
+			exit(UWSGI_FAILED_APP_CODE);
+		}
 	}
 
 	paste_app = PyEval_CallObject(paste_loadapp, paste_arg);

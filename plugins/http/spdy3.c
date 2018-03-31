@@ -556,8 +556,10 @@ static ssize_t spdy_inflate_http_headers(struct http_session *hr) {
 		}
 
 		if (!uwsgi_strncmp(cgi_name, nk_len, "HTTP_HOST", 9)) {
-			new_peer->key = new_peer->out->buf + (new_peer->out->pos - v_len);
-			new_peer->key_len = v_len;
+			if (v_len <= 0xff) {
+				memcpy(new_peer->key, new_peer->out->buf + (new_peer->out->pos - v_len), v_len);
+				new_peer->key_len = v_len;
+			}
 		}
 		else if (!uwsgi_strncmp(cgi_name, nk_len, "REQUEST_URI", 11)) {
 			char *path_info = new_peer->out->buf + (new_peer->out->pos - v_len);
@@ -838,9 +840,11 @@ void uwsgi_spdy_info_cb(SSL const *ssl, int where, int ret) {
 				//hr->spdy_hook = hr_recv_spdy_control_frame;
 			}
 		}
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
                 if (ssl->s3) {
                         ssl->s3->flags |= SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS;
                 }
+#endif
         }
 }
 

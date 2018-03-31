@@ -20,6 +20,17 @@
 
 extern struct uwsgi_server uwsgi;
 
+char *uwsgi_subscription_algo_name(void *ptr) {
+	struct uwsgi_string_list *usl = uwsgi.subscription_algos;
+	while(usl) {
+		if (usl->custom_ptr == ptr) {
+			return usl->value;
+		}
+		usl = usl->next;
+	}
+	return NULL;
+}
+
 #ifdef UWSGI_SSL
 static void uwsgi_subscription_sni_check(struct uwsgi_subscribe_slot *current_slot, struct uwsgi_subscribe_req *usr) {
 	if (usr->sni_key_len > 0 && usr->sni_crt_len > 0) {
@@ -72,6 +83,8 @@ int uwsgi_subscription_credentials_check(struct uwsgi_subscribe_slot *slot, stru
 }
 
 struct uwsgi_subscribe_slot *uwsgi_get_subscribe_slot(struct uwsgi_subscribe_slot **slot, char *key, uint16_t keylen) {
+	int retried = 0;
+retry:
 
 	if (keylen > 0xff)
 		return NULL;
@@ -125,136 +138,20 @@ struct uwsgi_subscribe_slot *uwsgi_get_subscribe_slot(struct uwsgi_subscribe_slo
 			break;
 	}
 
+	// if we are here and in mountpoints mode, try the domain only variant
+	if (uwsgi.subscription_mountpoints && !retried) {
+		char *slash = memchr(key, '/', keylen);
+		if (slash) {
+			keylen = slash - key;
+			retried = 1;
+			goto retry;
+		}
+	}
+
 	return NULL;
 }
 
-// least reference count
-static struct uwsgi_subscribe_node *uwsgi_subscription_algo_lrc(struct uwsgi_subscribe_slot *current_slot, struct uwsgi_subscribe_node *node) {
-	// if node is NULL we are in the second step (in lrc mode we do not use the first step)
-	if (node)
-		return NULL;
-
-	struct uwsgi_subscribe_node *choosen_node = NULL;
-	node = current_slot->nodes;
-	uint64_t min_rc = 0;
-	while (node) {
-		if (!node->death_mark) {
-			if (min_rc == 0 || node->reference < min_rc) {
-				min_rc = node->reference;
-				choosen_node = node;
-				if (min_rc == 0 && !(node->next && node->next->reference <= node->reference && node->next->last_requests <= node->last_requests))
-					break;
-			}
-		}
-		node = node->next;
-	}
-
-	if (choosen_node) {
-		choosen_node->reference++;
-	}
-
-	return choosen_node;
-}
-
-// weighted least reference count
-static struct uwsgi_subscribe_node *uwsgi_subscription_algo_wlrc(struct uwsgi_subscribe_slot *current_slot, struct uwsgi_subscribe_node *node) {
-	// if node is NULL we are in the second step (in wlrc mode we do not use the first step)
-	if (node)
-		return NULL;
-
-	struct uwsgi_subscribe_node *choosen_node = NULL;
-	node = current_slot->nodes;
-	double min_rc = 0;
-	while (node) {
-		if (!node->death_mark) {
-			// node->weight is always >= 1, we can safely use it as divider
-			double ref = (double) node->reference / (double) node->weight;
-			double next_node_ref = 0;
-			if (node->next)
-				next_node_ref = (double) node->next->reference / (double) node->next->weight;
-
-			if (min_rc == 0 || ref < min_rc) {
-				min_rc = ref;
-				choosen_node = node;
-				if (min_rc == 0 && !(node->next && next_node_ref <= ref && node->next->last_requests <= node->last_requests))
-					break;
-			}
-		}
-		node = node->next;
-	}
-
-	if (choosen_node) {
-		choosen_node->reference++;
-	}
-
-	return choosen_node;
-}
-
-// weighted round robin algo
-static struct uwsgi_subscribe_node *uwsgi_subscription_algo_wrr(struct uwsgi_subscribe_slot *current_slot, struct uwsgi_subscribe_node *node) {
-	// if node is NULL we are in the second step
-	if (node) {
-		if (node->death_mark == 0 && node->wrr > 0) {
-			node->wrr--;
-			node->reference++;
-			return node;
-		}
-		return NULL;
-	}
-
-	// no wrr > 0 node found, reset them
-	node = current_slot->nodes;
-	uint64_t min_weight = 0;
-	while (node) {
-		if (!node->death_mark) {
-			if (min_weight == 0 || node->weight < min_weight)
-				min_weight = node->weight;
-		}
-		node = node->next;
-	}
-
-	// now set wrr
-	node = current_slot->nodes;
-	struct uwsgi_subscribe_node *choosen_node = NULL;
-	while (node) {
-		if (!node->death_mark) {
-			node->wrr = node->weight / min_weight;
-			choosen_node = node;
-		}
-		node = node->next;
-	}
-	if (choosen_node) {
-		choosen_node->wrr--;
-		choosen_node->reference++;
-	}
-	return choosen_node;
-}
-
-void uwsgi_subscription_set_algo(char *algo) {
-
-	if (!algo)
-		goto wrr;
-
-	if (!strcmp(algo, "wrr")) {
-		uwsgi.subscription_algo = uwsgi_subscription_algo_wrr;
-		return;
-	}
-
-	if (!strcmp(algo, "lrc")) {
-		uwsgi.subscription_algo = uwsgi_subscription_algo_lrc;
-		return;
-	}
-
-	if (!strcmp(algo, "wlrc")) {
-		uwsgi.subscription_algo = uwsgi_subscription_algo_wlrc;
-		return;
-	}
-
-wrr:
-	uwsgi.subscription_algo = uwsgi_subscription_algo_wrr;
-}
-
-struct uwsgi_subscribe_node *uwsgi_get_subscribe_node(struct uwsgi_subscribe_slot **slot, char *key, uint16_t keylen) {
+struct uwsgi_subscribe_node *uwsgi_get_subscribe_node(struct uwsgi_subscribe_slot **slot, char *key, uint16_t keylen, struct uwsgi_subscription_client *client) {
 
 	if (keylen > 0xff)
 		return NULL;
@@ -267,11 +164,20 @@ struct uwsgi_subscribe_node *uwsgi_get_subscribe_node(struct uwsgi_subscribe_slo
 	current_slot->hits++;
 	time_t now = uwsgi_now();
 	struct uwsgi_subscribe_node *node = current_slot->nodes;
+	int subscription_age;
+
 	while (node) {
+		subscription_age = now - node->last_check;
 		// is the node alive ?
-		if (now - node->last_check > uwsgi.subscription_tolerance) {
-			if (node->death_mark == 0)
-				uwsgi_log("[uwsgi-subscription for pid %d] %.*s => marking %.*s as failed (no announce received in %d seconds)\n", (int) uwsgi.mypid, (int) keylen, key, (int) node->len, node->name, uwsgi.subscription_tolerance);
+		if ((node->len == 0 && (subscription_age > uwsgi.subscription_tolerance_inactive)) || (node->len > 0 && (subscription_age > uwsgi.subscription_tolerance))) {
+			if (node->death_mark == 0) {
+				if (node->len > 0) {
+					uwsgi_log("[uwsgi-subscription for pid %d] %.*s => marking %.*s as failed (no announce received in %d seconds)\n", (int) uwsgi.mypid, (int) keylen, key, (int) node->len, node->name, uwsgi.subscription_tolerance);
+				}
+				else if (node->vassal_len > 0) {
+					uwsgi_log("[uwsgi-subscription for pid %d] %.*s => marking vassal %.*s as failed (no announce received in %d seconds)\n", (int) uwsgi.mypid, (int) keylen, key, (int) node->vassal_len, node->vassal, uwsgi.subscription_tolerance_inactive);
+				}
+			}
 			node->failcnt++;
 			node->death_mark = 1;
 		}
@@ -287,14 +193,14 @@ struct uwsgi_subscribe_node *uwsgi_get_subscribe_node(struct uwsgi_subscribe_slo
 			continue;
 		}
 
-		struct uwsgi_subscribe_node *choosen_node = uwsgi.subscription_algo(current_slot, node);
-		if (choosen_node)
-			return choosen_node;
+		struct uwsgi_subscribe_node *chosen_node = current_slot->algo(current_slot, node, client);
+		if (chosen_node)
+			return chosen_node;
 
 		node = node->next;
 	}
 
-	return uwsgi.subscription_algo(current_slot, node);
+	return current_slot->algo(current_slot, node, client);
 }
 
 struct uwsgi_subscribe_node *uwsgi_get_subscribe_node_by_name(struct uwsgi_subscribe_slot **slot, char *key, uint16_t keylen, char *val, uint16_t vallen) {
@@ -404,7 +310,10 @@ struct uwsgi_subscribe_node *uwsgi_add_subscribe_node(struct uwsgi_subscribe_slo
 	struct uwsgi_subscribe_slot *current_slot = uwsgi_get_subscribe_slot(slot, usr->key, usr->keylen), *old_slot = NULL, *a_slot;
 	struct uwsgi_subscribe_node *node, *old_node = NULL;
 
-	if (usr->address_len > 0xff || usr->address_len == 0)
+	if ((usr->address_len > 0xff || usr->address_len == 0) && (usr->vassal_len > 0xff || usr->vassal_len == 0))
+		return NULL;
+
+	if (uwsgi.subscription_vassal_required && usr->vassal_len == 0)
 		return NULL;
 
 	if (current_slot) {
@@ -418,24 +327,49 @@ struct uwsgi_subscribe_node *uwsgi_add_subscribe_node(struct uwsgi_subscribe_slo
 			return NULL;
 		}
 
+		int has_address_and_vassal = 0;
+		if (usr->address_len > 0 && usr->vassal_len > 0)
+			has_address_and_vassal = 1;
+
 		node = current_slot->nodes;
 		while (node) {
-			if (!uwsgi_strncmp(node->name, node->len, usr->address, usr->address_len)) {
+			if ((usr->address_len > 0 && !uwsgi_strncmp(node->name, node->len, usr->address, usr->address_len))
+				|| (usr->vassal_len > 0 && !uwsgi_strncmp(node->vassal, node->vassal_len, usr->vassal, usr->vassal_len))) {
 #ifdef UWSGI_SSL
 				// this should avoid sending sniffed packets...
 				if (current_slot->sign_ctx && !subscription_is_safe(usr) && usr->unix_check <= node->unix_check) {
-					uwsgi_log("[uwsgi-subscription for pid %d] invalid (sniffed ?) packet sent for slot: %.*s node: %.*s unix_check: %lu\n", (int) uwsgi.mypid, usr->keylen, usr->key, usr->address_len, usr->address, (unsigned long) usr->unix_check);
+					uwsgi_log("[uwsgi-subscription for pid %d] invalid (sniffed ?) packet sent for slot: %.*s node: %.*s unix_check: %lu\n", (int) uwsgi.mypid, usr->keylen, usr->key, (int) usr->address_len, usr->address, (unsigned long) usr->unix_check);
 					return NULL;
 				}
 				// eventually the packet could be upgraded to sni...
 				uwsgi_subscription_sni_check(current_slot, usr);
 #endif
+				// only for vassal mode
+				if (has_address_and_vassal) {
+					if (usr->address_len == node->len && !memcmp(usr->address, node->name, node->len)) {
+						// record already exists, clear it ?
+						if (usr->clear) {
+							node->len = 0;
+							uwsgi_log("[uwsgi-subscription for pid %d] %.*s => cleared address for vassal node: %.*s (weight: %d, backup: %d)\n", (int) uwsgi.mypid, usr->keylen, usr->key, (int) usr->vassal_len, usr->vassal, usr->weight, usr->backup_level);
+						}
+					}
+					else {
+						memcpy(node->name, usr->address, usr->address_len);
+						node->len = usr->address_len;
+						uwsgi_log("[uwsgi-subscription for pid %d] %.*s => updated vassal node: %.*s with address %.*s (weight: %d, backup: %d)\n", (int) uwsgi.mypid, usr->keylen, usr->key, (int) usr->vassal_len, usr->vassal, (int) usr->address_len, usr->address, usr->weight, usr->backup_level);	
+					}
+				}
+
 				// remove death mark and update cores and load
 				node->death_mark = 0;
 				node->last_check = uwsgi_now();
 				node->cores = usr->cores;
 				node->load = usr->load;
 				node->weight = usr->weight;
+				node->backup_level = usr->backup_level;
+				if (usr->proto_len > 0) {
+					node->proto = usr->proto[0];
+				}	
 				if (!node->weight)
 					node->weight = 1;
 				node->last_requests = 0;
@@ -468,6 +402,10 @@ struct uwsgi_subscribe_node *uwsgi_add_subscribe_node(struct uwsgi_subscribe_slo
 		node->cores = usr->cores;
 		node->load = usr->load;
 		node->weight = usr->weight;
+		node->backup_level = usr->backup_level;
+		if (usr->proto_len > 0) {
+			node->proto = usr->proto[0];
+		}
 		node->unix_check = usr->unix_check;
 		if (!node->weight)
 			node->weight = 1;
@@ -482,13 +420,19 @@ struct uwsgi_subscribe_node *uwsgi_add_subscribe_node(struct uwsgi_subscribe_slo
 		}
 		node->last_check = uwsgi_now();
 		node->slot = current_slot;
-		memcpy(node->name, usr->address, usr->address_len);
+		node->vassal_len = usr->vassal_len;
+
+		if (node->len > 0)
+			memcpy(node->name, usr->address, node->len);
+		if (usr->vassal_len > 0)
+			memcpy(node->vassal, usr->vassal, node->vassal_len);
+		
 		if (old_node) {
 			old_node->next = node;
 		}
 		node->next = NULL;
 
-		uwsgi_log("[uwsgi-subscription for pid %d] %.*s => new node: %.*s\n", (int) uwsgi.mypid, usr->keylen, usr->key, usr->address_len, usr->address);
+		uwsgi_log("[uwsgi-subscription for pid %d] %.*s => new node: %.*s (weight: %d, backup: %d)\n", (int) uwsgi.mypid, usr->keylen, usr->key, usr->address_len, usr->address, usr->weight, usr->backup_level);
 		if (node->notify[0]) {
 			char buf[1024];
 			int ret = snprintf(buf, 1024, "[subscription ack] %.*s => new node: %.*s", usr->keylen, usr->key, usr->address_len, usr->address);
@@ -539,6 +483,10 @@ struct uwsgi_subscribe_node *uwsgi_add_subscribe_node(struct uwsgi_subscribe_slo
 		current_slot->nodes->cores = usr->cores;
 		current_slot->nodes->load = usr->load;
 		current_slot->nodes->weight = usr->weight;
+		current_slot->nodes->backup_level = usr->backup_level;
+		if (usr->proto_len > 0) {
+			current_slot->nodes->proto = usr->proto[0];
+		}
 		current_slot->nodes->unix_check = usr->unix_check;
 		if (!current_slot->nodes->weight)
 			current_slot->nodes->weight = 1;
@@ -551,7 +499,11 @@ struct uwsgi_subscribe_node *uwsgi_add_subscribe_node(struct uwsgi_subscribe_slo
 			memcpy(current_slot->nodes->notify, usr->notify, usr->notify_len);
 			current_slot->nodes->notify[usr->notify_len] = 0;
 		}
-		memcpy(current_slot->nodes->name, usr->address, usr->address_len);
+		if (usr->address_len > 0)
+			memcpy(current_slot->nodes->name, usr->address, usr->address_len);
+		current_slot->nodes->vassal_len = usr->vassal_len;
+		if (current_slot->nodes->vassal_len > 0)
+			memcpy(current_slot->nodes->vassal, usr->vassal, usr->vassal_len);
 		current_slot->nodes->last_check = uwsgi_now();
 
 		current_slot->nodes->next = NULL;
@@ -570,13 +522,20 @@ struct uwsgi_subscribe_node *uwsgi_add_subscribe_node(struct uwsgi_subscribe_slo
 		current_slot->prev = old_slot;
 		current_slot->next = NULL;
 
+		current_slot->algo = usr->algo;
+		if (!current_slot->algo) current_slot->algo = uwsgi.subscription_algo;
 
 		if (!slot[hash_key] || current_slot->prev == NULL) {
 			slot[hash_key] = current_slot;
 		}
 
-		uwsgi_log("[uwsgi-subscription for pid %d] new pool: %.*s (hash key: %d)\n", (int) uwsgi.mypid, usr->keylen, usr->key, current_slot->hash);
-		uwsgi_log("[uwsgi-subscription for pid %d] %.*s => new node: %.*s\n", (int) uwsgi.mypid, usr->keylen, usr->key, usr->address_len, usr->address);
+		uwsgi_log("[uwsgi-subscription for pid %d] new pool: %.*s (hash key: %d, algo: %s)\n", (int) uwsgi.mypid, usr->keylen, usr->key, current_slot->hash, uwsgi_subscription_algo_name(current_slot->algo));
+		if (usr->address_len > 0) {
+			uwsgi_log("[uwsgi-subscription for pid %d] %.*s => new node: %.*s (weight: %d, backup: %d)\n", (int) uwsgi.mypid, usr->keylen, usr->key, usr->address_len, usr->address, usr->weight, usr->backup_level);
+		}
+		else {
+			uwsgi_log("[uwsgi-subscription for pid %d] %.*s => new vassal node: %.*s (weight: %d, backup: %d)\n", (int) uwsgi.mypid, usr->keylen, usr->key, usr->vassal_len, usr->vassal, usr->weight, usr->backup_level);
+		}
 
 		if (current_slot->nodes->notify[0]) {
 			char buf[1024];
@@ -669,6 +628,30 @@ static void send_subscription(int sfd, char *host, char *message, uint16_t messa
 		close(fd);
 }
 
+static int uwsgi_subscription_ub_fix(struct uwsgi_buffer *ub, uint8_t modifier1, uint8_t modifier2, uint8_t cmd, char *sign) {
+	#ifdef UWSGI_SSL
+        if (sign) {
+                if (uwsgi_buffer_append_keynum(ub, "unix", 4, (uwsgi_now() + (time_t) cmd)))
+                        return -1;
+
+                unsigned int signature_len = 0;
+                char *signature = uwsgi_rsa_sign(sign, ub->buf + 4, ub->pos - 4, &signature_len);
+                if (signature && signature_len > 0) {
+                        if (uwsgi_buffer_append_keyval(ub, "sign", 4, signature, signature_len)) {
+                                free(signature);
+				return -1;
+                        }
+                        free(signature);
+                }
+        }
+#endif
+
+        // add uwsgi header
+        if (uwsgi_buffer_set_uh(ub, 224, cmd)) return -1;
+
+	return 0;
+}
+
 static struct uwsgi_buffer *uwsgi_subscription_ub(char *key, size_t keysize, uint8_t modifier1, uint8_t modifier2, uint8_t cmd, char *socket_name, char *sign, char *sni_key, char *sni_crt, char *sni_ca) {
 	struct uwsgi_buffer *ub = uwsgi_buffer_new(4096);
 
@@ -679,6 +662,10 @@ static struct uwsgi_buffer *uwsgi_subscription_ub(char *key, size_t keysize, uin
 		goto end;
 	if (uwsgi_buffer_append_keyval(ub, "address", 7, socket_name, strlen(socket_name)))
 		goto end;
+
+	if (uwsgi.subscribe_with_modifier1) {
+		modifier1 = atoi(uwsgi.subscribe_with_modifier1);
+	}
 	if (uwsgi_buffer_append_keynum(ub, "modifier1", 9, modifier1))
 		goto end;
 	if (uwsgi_buffer_append_keynum(ub, "modifier2", 9, modifier2))
@@ -720,26 +707,7 @@ static struct uwsgi_buffer *uwsgi_subscription_ub(char *key, size_t keysize, uin
 			goto end;
 	}
 
-#ifdef UWSGI_SSL
-	if (sign) {
-		if (uwsgi_buffer_append_keynum(ub, "unix", 4, (uwsgi_now() + (time_t) cmd)))
-			goto end;
-
-		unsigned int signature_len = 0;
-		char *signature = uwsgi_rsa_sign(sign, ub->buf + 4, ub->pos - 4, &signature_len);
-		if (signature && signature_len > 0) {
-			if (uwsgi_buffer_append_keyval(ub, "sign", 4, signature, signature_len)) {
-				free(signature);
-				goto end;
-			}
-			free(signature);
-		}
-	}
-#endif
-
-	// add uwsgi header
-	if (uwsgi_buffer_set_uh(ub, 224, cmd))
-		goto end;
+	if (uwsgi_subscription_ub_fix(ub, modifier1, modifier2, cmd, sign)) goto end;
 
 	return ub;
 
@@ -859,13 +827,6 @@ int uwsgi_no_subscriptions(struct uwsgi_subscribe_slot **slot) {
 			return 0;
 	}
 	return 1;
-}
-
-struct uwsgi_subscribe_slot **uwsgi_subscription_init_ht() {
-	if (!uwsgi.subscription_algo) {
-		uwsgi_subscription_set_algo(NULL);
-	}
-	return uwsgi_calloc(sizeof(struct uwsgi_subscription_slot *) * UMAX16);
 }
 
 void uwsgi_subscribe(char *subscription, uint8_t cmd) {
@@ -1014,8 +975,33 @@ void uwsgi_subscribe2(char *arg, uint8_t cmd) {
 	char *s2_sni_key = NULL;
 	char *s2_sni_crt = NULL;
 	char *s2_sni_ca = NULL;
+	char *s2_proto = NULL;
+	char *s2_algo = NULL;
+	char *s2_backup = NULL;
+	char *s2_vassal = NULL;
+	char *s2_inactive = NULL;
+	struct uwsgi_buffer *ub = NULL;
 
-	if (uwsgi_kvlist_parse(arg, strlen(arg), ',', '=', "server", &s2_server, "key", &s2_key, "socket", &s2_socket, "addr", &s2_addr, "weight", &s2_weight, "modifier1", &s2_modifier1, "modifier2", &s2_modifier2, "sign", &s2_sign, "check", &s2_check, "sni_key", &s2_sni_key, "sni_crt", &s2_sni_crt, "sni_ca", &s2_sni_ca, NULL)) {
+	if (uwsgi_kvlist_parse(arg, strlen(arg), ',', '=',
+		"server", &s2_server,
+		"key", &s2_key,
+		"socket", &s2_socket,
+		"addr", &s2_addr,
+		"address", &s2_addr,
+		"weight", &s2_weight,
+		"modifier1", &s2_modifier1,
+		"modifier2", &s2_modifier2,
+		"sign", &s2_sign,
+		"check", &s2_check,
+		"sni_key", &s2_sni_key,
+		"sni_crt", &s2_sni_crt,
+		"sni_ca", &s2_sni_ca,
+		"proto", &s2_proto,
+		"algo", &s2_algo,
+		"backup", &s2_backup,
+		"vassal", &s2_vassal,
+		"inactive", &s2_inactive,
+		NULL)) {
 		return;
 	}
 
@@ -1027,8 +1013,15 @@ void uwsgi_subscribe2(char *arg, uint8_t cmd) {
 			goto end;
 	}
 
+	int weight = 1;
+	int backup = 0;
+	if (uwsgi.auto_weight) weight = uwsgi.numproc * uwsgi.cores;
 	if (s2_weight) {
-		uwsgi.weight = atoi(s2_weight);
+		weight = atoi(s2_weight);
+	}
+
+	if (s2_backup) {
+		backup = atoi(s2_backup);
 	}
 
 	if (s2_socket) {
@@ -1052,8 +1045,93 @@ void uwsgi_subscribe2(char *arg, uint8_t cmd) {
 		modifier2 = atoi(s2_modifier2);
 	}
 
-	uwsgi_send_subscription(s2_server, s2_key, strlen(s2_key), modifier1, modifier2, cmd, s2_addr, s2_sign, s2_sni_key, s2_sni_crt, s2_sni_ca);
+	if (s2_addr == NULL) {
+		// no socket... no subscription
+		if (!uwsgi.sockets) goto end;
+		s2_addr = uwsgi_str(uwsgi.sockets->name);
+	}
+
+        ub = uwsgi_buffer_new(uwsgi.page_size);
+        if (!ub) goto end;
+	// leave space for the header
+	ub->pos = 4;
+
+	if (uwsgi_buffer_append_keyval(ub, "key", 3, s2_key, strlen(s2_key)))
+                goto end;
+        if (uwsgi_buffer_append_keyval(ub, "address", 7, s2_addr, strlen(s2_addr)))
+                goto end;
+        if (uwsgi_buffer_append_keynum(ub, "modifier1", 9, modifier1))
+                goto end;
+        if (uwsgi_buffer_append_keynum(ub, "modifier2", 9, modifier2))
+                goto end;
+        if (uwsgi_buffer_append_keynum(ub, "cores", 5, uwsgi.numproc * uwsgi.cores))
+                goto end;
+        if (uwsgi_buffer_append_keynum(ub, "load", 4, uwsgi.shared->load))
+                goto end;
+        if (uwsgi_buffer_append_keynum(ub, "weight", 6, weight))
+        	goto end;
+        if (uwsgi_buffer_append_keynum(ub, "backup", 6, backup))
+        	goto end;
+
+	if (s2_vassal) {
+                if (uwsgi_buffer_append_keyval(ub, "vassal", 6, s2_vassal, strlen(s2_vassal)))
+                        goto end;
+	}
+
+        if (s2_sni_key) {
+                if (uwsgi_buffer_append_keyval(ub, "sni_key", 7, s2_sni_key, strlen(s2_sni_key)))
+                        goto end;
+        }
+
+        if (s2_sni_crt) {
+                if (uwsgi_buffer_append_keyval(ub, "sni_crt", 7, s2_sni_crt, strlen(s2_sni_crt)))
+                        goto end;
+        }
+
+        if (s2_sni_ca) {
+                if (uwsgi_buffer_append_keyval(ub, "sni_ca", 6, s2_sni_ca, strlen(s2_sni_ca)))
+                        goto end;
+        }
+
+	if (s2_proto) {
+                if (uwsgi_buffer_append_keyval(ub, "proto", 5, s2_proto, strlen(s2_proto)))
+                        goto end;
+	}
+
+	if (s2_algo) {
+                if (uwsgi_buffer_append_keyval(ub, "algo", 4, s2_algo, strlen(s2_algo)))
+                        goto end;
+	}
+
+	if (s2_inactive) {
+                if (uwsgi_buffer_append_keyval(ub, "inactive", 8, s2_inactive, strlen(s2_inactive)))
+                        goto end;
+	}
+
+        if (uwsgi.subscription_notify_socket) {
+                if (uwsgi_buffer_append_keyval(ub, "notify", 6, uwsgi.subscription_notify_socket, strlen(uwsgi.subscription_notify_socket)))
+                        goto end;
+        }
+        else if (uwsgi.notify_socket_fd > -1 && uwsgi.notify_socket) {
+                if (uwsgi_buffer_append_keyval(ub, "notify", 6, uwsgi.notify_socket, strlen(uwsgi.notify_socket)))
+                        goto end;
+        }
+
+	// clear instead of unsubscribe
+	if (uwsgi_instance_is_dying && cmd == 1 && uwsgi.subscription_clear_on_shutdown) {
+		if (uwsgi_buffer_append_keynum(ub, "clear", 5, 1))
+                	goto end;
+		cmd = 0;
+	}
+
+        if (uwsgi_subscription_ub_fix(ub, modifier1, modifier2, cmd, s2_sign)) goto end;
+
+        send_subscription(-1, s2_server, ub->buf, ub->pos);
+
 end:
+	if (ub)
+		uwsgi_buffer_destroy(ub);
+
 	if (s2_server)
 		free(s2_server);
 	if (s2_key)
@@ -1078,6 +1156,16 @@ end:
 		free(s2_sni_key);
 	if (s2_sni_ca)
 		free(s2_sni_ca);
+	if (s2_proto)
+		free(s2_proto);
+	if (s2_algo)
+		free(s2_algo);
+	if (s2_inactive)
+		free(s2_inactive);
+	if (s2_backup)
+		free(s2_backup);
+	if (s2_vassal)
+		free(s2_vassal);
 }
 
 void uwsgi_subscribe_all(uint8_t cmd, int verbose) {
@@ -1104,4 +1192,242 @@ void uwsgi_subscribe_all(uint8_t cmd, int verbose) {
 		subscriptions = subscriptions->next;
 	}
 
+}
+
+// iphash
+static struct uwsgi_subscribe_node *uwsgi_subscription_algo_iphash(struct uwsgi_subscribe_slot *current_slot, struct uwsgi_subscribe_node *node, struct uwsgi_subscription_client *client) {
+        // if node is NULL we are in the second step (in lrc mode we do not use the first step)
+        if (node)
+                return NULL;
+
+	// iphash does not support requests without client data
+	if (!client) return NULL;
+	if (!client->sockaddr) return NULL;
+	uint64_t count = 0;
+	// first step is counting the number of nodes
+	node = current_slot->nodes;
+	while(node) {
+		if (!node->death_mark) count++;
+		node = node->next;
+	}
+	if (count == 0) return NULL;
+
+	uint64_t hash = 0;
+
+	//hash the ip
+	if (client->sockaddr->sa.sa_family == AF_INET) {
+		hash = client->sockaddr->sa_in.sin_addr.s_addr % count;
+	}
+#ifdef AF_INET6
+	else if (client->sockaddr->sa.sa_family == AF_INET6) {
+		hash = djb33x_hash((char *)client->sockaddr->sa_in6.sin6_addr.s6_addr, 16) % count;
+	}
+#endif
+		
+	// now re-iterate until count matches;
+	count = 0;
+        struct uwsgi_subscribe_node *chosen_node = NULL;
+        node = current_slot->nodes;
+        while (node) {
+                if (!node->death_mark) {
+			if (count == hash) {
+				chosen_node = node;
+				break;
+			}
+			count++;
+                }
+                node = node->next;
+        }
+
+        if (chosen_node) {
+                chosen_node->reference++;
+        }
+
+        return chosen_node;
+}
+
+// least reference count
+static struct uwsgi_subscribe_node *uwsgi_subscription_algo_lrc(struct uwsgi_subscribe_slot *current_slot, struct uwsgi_subscribe_node *node, struct uwsgi_subscription_client *client) {
+	uint64_t backup_level = 0;
+        uint64_t has_backup = 0;
+
+        // if node is NULL we are in the second step (in lrc mode we do not use the first step)
+        if (node)
+                return NULL;
+
+        struct uwsgi_subscribe_node *chosen_node = NULL;
+retry:
+        node = current_slot->nodes;
+        uint64_t min_rc = 0;
+        while (node) {
+                if (!node->death_mark) {
+			if (node->backup_level == backup_level) {
+                        	if (min_rc == 0 || node->reference < min_rc) {
+                                	min_rc = node->reference;
+                                	chosen_node = node;
+                                	if (min_rc == 0 && !(node->next && node->next->reference <= node->reference && node->next->last_requests <= node->last_requests))
+                                        	break;
+                        	}
+			}
+			else if (node->backup_level > backup_level && (!has_backup || has_backup > node->backup_level)) {
+                                has_backup = node->backup_level;
+                        }
+                }
+                node = node->next;
+        }
+
+        if (chosen_node) {
+                chosen_node->reference++;
+        }
+	else if (has_backup) {
+                backup_level = has_backup;
+                goto retry;
+        }
+
+        return chosen_node;
+}
+
+// weighted least reference count
+static struct uwsgi_subscribe_node *uwsgi_subscription_algo_wlrc(struct uwsgi_subscribe_slot *current_slot, struct uwsgi_subscribe_node *node, struct uwsgi_subscription_client *client) {
+	uint64_t backup_level = 0;
+        uint64_t has_backup = 0;
+
+        // if node is NULL we are in the second step (in wlrc mode we do not use the first step)
+        if (node)
+                return NULL;
+
+        struct uwsgi_subscribe_node *chosen_node = NULL;
+retry:
+        node = current_slot->nodes;
+	has_backup = 0;
+        double min_rc = 0;
+        while (node) {
+                if (!node->death_mark) {
+			if (node->backup_level == backup_level) {
+                        	// node->weight is always >= 1, we can safely use it as divider
+                        	double ref = (double) node->reference / (double) node->weight;
+                        	double next_node_ref = 0;
+                        	if (node->next)
+                                	next_node_ref = (double) node->next->reference / (double) node->next->weight;
+
+                        	if (min_rc == 0 || ref < min_rc) {
+                                	min_rc = ref;
+                                	chosen_node = node;
+                                	if (min_rc == 0 && !(node->next && next_node_ref <= ref && node->next->last_requests <= node->last_requests))
+                                	        break;
+                        	}
+			}
+			else if (node->backup_level > backup_level && (!has_backup || has_backup > node->backup_level)) {
+                                has_backup = node->backup_level;
+                        }
+                }
+                node = node->next;
+        }
+
+        if (chosen_node) {
+                chosen_node->reference++;
+        }
+	else if (has_backup) {
+                backup_level = has_backup;
+                goto retry;
+        }
+
+        return chosen_node;
+}
+
+// weighted round robin algo (with backup support)
+static struct uwsgi_subscribe_node *uwsgi_subscription_algo_wrr(struct uwsgi_subscribe_slot *current_slot, struct uwsgi_subscribe_node *node, struct uwsgi_subscription_client *client) {
+	uint64_t backup_level = 0;
+	uint64_t has_backup = 0;
+        // if node is NULL we are in the second step
+        if (node) {
+                if (node->death_mark == 0 && node->wrr > 0) {
+                        node->wrr--;
+                        node->reference++;
+                        return node;
+                }
+                return NULL;
+        }
+
+        // no wrr > 0 node found, reset them
+        node = current_slot->nodes;
+        uint64_t min_weight = 0;
+        while (node) {
+                if (!node->death_mark) {
+                        if (min_weight == 0 || node->weight < min_weight)
+                                min_weight = node->weight;
+                }
+                node = node->next;
+        }
+
+        // now set wrr
+retry:
+        node = current_slot->nodes;
+	has_backup = 0;
+        struct uwsgi_subscribe_node *chosen_node = NULL;
+        while (node) {
+                if (!node->death_mark) {
+			if (node->backup_level == backup_level) {
+                        	node->wrr = node->weight / min_weight;
+                        	chosen_node = node;
+                	}
+			else if (node->backup_level > backup_level && (!has_backup || has_backup > node->backup_level)) {
+				has_backup = node->backup_level;
+			}
+		}
+                node = node->next;
+        }
+        if (chosen_node) {
+                chosen_node->wrr--;
+                chosen_node->reference++;
+        }
+	else if (has_backup) {
+		backup_level = has_backup;
+		goto retry;
+	}
+        return chosen_node;
+}
+
+void uwsgi_subscription_init_algos() {
+
+	uwsgi_register_subscription_algo("wrr", uwsgi_subscription_algo_wrr);
+	uwsgi_register_subscription_algo("lrc", uwsgi_subscription_algo_lrc);
+	uwsgi_register_subscription_algo("wlrc", uwsgi_subscription_algo_wlrc);
+	uwsgi_register_subscription_algo("iphash", uwsgi_subscription_algo_iphash);
+}
+
+void uwsgi_subscription_set_algo(char *algo) {
+	if (!uwsgi.subscription_algos) {
+		uwsgi_subscription_init_algos();
+	}
+	if (!algo)
+                goto wrr;
+	uwsgi.subscription_algo = uwsgi_subscription_algo_get(algo, strlen(algo));
+	if (uwsgi.subscription_algo) return ;
+
+wrr:
+        uwsgi.subscription_algo = uwsgi_subscription_algo_wrr;
+}
+
+// we are lazy for subscription algos, we initialize them only if needed
+struct uwsgi_subscribe_slot **uwsgi_subscription_init_ht() {
+        if (!uwsgi.subscription_algo) {
+                uwsgi_subscription_set_algo(NULL);
+        }
+        return uwsgi_calloc(sizeof(struct uwsgi_subscription_slot *) * UMAX16);
+}
+
+struct uwsgi_subscribe_node *(*uwsgi_subscription_algo_get(char *name , size_t len))(struct uwsgi_subscribe_slot *, struct uwsgi_subscribe_node *, struct uwsgi_subscription_client *) {
+	struct uwsgi_string_list *usl = NULL;
+	uwsgi_foreach(usl, uwsgi.subscription_algos) {
+		if (!uwsgi_strncmp(usl->value, usl->len, name, len)) {
+			return (struct uwsgi_subscribe_node *(*)(struct uwsgi_subscribe_slot *, struct uwsgi_subscribe_node *, struct uwsgi_subscription_client *)) usl->custom_ptr;
+		}
+	}
+	return NULL;
+}
+
+void uwsgi_register_subscription_algo(char *name, struct uwsgi_subscribe_node *(*func)(struct uwsgi_subscribe_slot *, struct uwsgi_subscribe_node *, struct uwsgi_subscription_client *)) {
+	struct uwsgi_string_list *usl = uwsgi_string_new_list(&uwsgi.subscription_algos, name);	
+	usl->custom_ptr = func;
 }

@@ -14,35 +14,31 @@ increase write_errors on error to force socket close
 */
 
 int uwsgi_proto_puwsgi_parser(struct wsgi_request *wsgi_req) {
-	ssize_t len;
 	char *ptr = (char *) wsgi_req->uh;
-	if (wsgi_req->proto_parser_pos < 4) {
-		len = read(wsgi_req->fd, ptr + wsgi_req->proto_parser_pos, 4 - wsgi_req->proto_parser_pos);
-		if (len > 0) {
-			wsgi_req->proto_parser_pos += len;
-			if (wsgi_req->proto_parser_pos == 4) {
+        ssize_t len = read(wsgi_req->fd, ptr + wsgi_req->proto_parser_pos, (uwsgi.buffer_size + 4) - wsgi_req->proto_parser_pos);
+        if (len > 0) {
+                wsgi_req->proto_parser_pos += len;
+                if (wsgi_req->proto_parser_pos >= 4) {
 #ifdef __BIG_ENDIAN__
-                        	wsgi_req->uh->pktsize = uwsgi_swap16(wsgi_req->uh->pktsize);
+                        wsgi_req->uh->_pktsize = uwsgi_swap16(wsgi_req->uh->_pktsize);
 #endif
-				if (wsgi_req->uh->pktsize > uwsgi.buffer_size) {
-                                	uwsgi_log("invalid request block size: %u (max %u)...skip\n", wsgi_req->uh->pktsize, uwsgi.buffer_size);
-					wsgi_req->write_errors++;		
-                                	return -1;
-                        	}
-			}
-			return UWSGI_AGAIN;
-		}
-		goto negative;
-	}
-	len = read(wsgi_req->fd, ptr + wsgi_req->proto_parser_pos, wsgi_req->uh->pktsize - (wsgi_req->proto_parser_pos-4));
-	if (len > 0) {
-		wsgi_req->proto_parser_pos += len;
-		if ((wsgi_req->proto_parser_pos-4) == wsgi_req->uh->pktsize) {
-			return UWSGI_OK;	
-		}
-		return UWSGI_AGAIN;
-	}
-negative:
+                        wsgi_req->len = wsgi_req->uh->_pktsize;
+                        if ((wsgi_req->proto_parser_pos - 4) == wsgi_req->uh->_pktsize) {
+                                return UWSGI_OK;
+                        }
+                        if ((wsgi_req->proto_parser_pos - 4) > wsgi_req->uh->_pktsize) {
+                                wsgi_req->proto_parser_remains = wsgi_req->proto_parser_pos - (4 + wsgi_req->uh->_pktsize);
+                                wsgi_req->proto_parser_remains_buf = wsgi_req->buffer + wsgi_req->uh->_pktsize;
+                                return UWSGI_OK;
+                        }
+                        if (wsgi_req->uh->_pktsize > uwsgi.buffer_size) {
+                                uwsgi_log("invalid request block size: %u (max %u)...skip\n", wsgi_req->uh->_pktsize, uwsgi.buffer_size);
+				wsgi_req->write_errors++;
+                                return -1;
+                        }
+                }
+                return UWSGI_AGAIN;
+        }
 	if (len < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS) {
 			return UWSGI_AGAIN;
@@ -64,7 +60,7 @@ close the connection on errors, otherwise force edge triggering
 */
 void uwsgi_proto_puwsgi_close(struct wsgi_request *wsgi_req) {
 	// check for errors or incomplete packets
-	if (wsgi_req->write_errors || (size_t) (wsgi_req->uh->pktsize + 4) != wsgi_req->proto_parser_pos) {
+	if (wsgi_req->write_errors || (size_t) (wsgi_req->len + 4) != wsgi_req->proto_parser_pos) {
 		close(wsgi_req->fd);
 		wsgi_req->socket->retry[wsgi_req->async_id] = 0;
 		wsgi_req->socket->fd_threads[wsgi_req->async_id] = -1;

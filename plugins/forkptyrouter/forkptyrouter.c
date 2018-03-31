@@ -16,14 +16,14 @@
 
 extern struct uwsgi_server uwsgi;
 
-#if defined(__linux__) || defined(__GNU_kFreeBSD__)
+#if defined(__linux__) || defined(__GNU_kFreeBSD__) || defined(__HURD__)
 #include <pty.h>
 #elif defined(__APPLE__) || defined(__OpenBSD__) || defined(__NetBSD__)
 #include <util.h>
-#elif defined(__FreeBSD__)
+#elif defined(__FreeBSD__) || defined(__DragonFly__)
 #include <libutil.h>
 #endif
-#ifndef __FreeBSD__
+#if !defined(__FreeBSD__) && !defined(__DragonFly__)
 #include <utmp.h>
 #endif
 
@@ -76,7 +76,7 @@ static struct uwsgi_option forkptyrouter_options[] = {
 
 	{"forkptyrouter-fallback", required_argument, 0, "fallback to the specified node in case of error", uwsgi_opt_add_string_list, &ufpty.cr.fallback, 0},
 
-	{"forkptyrouter-events", required_argument, 0, "set the maximum number of concufptyent events", uwsgi_opt_set_int, &ufpty.cr.nevents, 0},
+	{"forkptyrouter-events", required_argument, 0, "set the maximum number of forkptyrouter events", uwsgi_opt_set_int, &ufpty.cr.nevents, 0},
 	{"forkptyrouter-cheap", no_argument, 0, "run the forkptyrouter in cheap mode", uwsgi_opt_true, &ufpty.cr.cheap, 0},
 
 	{"forkptyrouter-timeout", required_argument, 0, "set forkptyrouter timeout", uwsgi_opt_set_int, &ufpty.cr.socket_timeout, 0},
@@ -134,7 +134,7 @@ static ssize_t fpty_parse_uwsgi(struct corerouter_peer *peer) {
 	for(;;) {
 	if (peer->in->pos < 4) return 0;
 	struct uwsgi_header *uh = (struct uwsgi_header *) peer->in->buf;
-	uint16_t pktsize = uh->pktsize;
+	uint16_t pktsize = uh->_pktsize;
 	switch(uh->modifier2) {
 		case 0:
 			// stdin

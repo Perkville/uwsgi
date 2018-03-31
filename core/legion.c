@@ -277,14 +277,12 @@ static void legions_check_nodes_step2() {
 			memcpy(best_uuid, node->uuid, 36);
 		}
 		// go on if i am not an arbiter
-		else if (ul->valor > 0) {
-			// no potential Lord is available, i will propose myself
-			// but only if i am not suspended...
-			if (uwsgi_now() > ul->suspended_til) {
-				best_valor = ul->valor;
-				memcpy(best_uuid, ul->uuid, 36);
-				i_am_the_best = 1;
-			}
+		// no potential Lord is available, i will propose myself
+		// but only if i am not suspended...
+		else if (ul->valor > 0 && uwsgi_now() > ul->suspended_til) {
+			best_valor = ul->valor;
+			memcpy(best_uuid, ul->uuid, 36);
+			i_am_the_best = 1;
 		}
 		else {
 			// empty lord
@@ -572,7 +570,7 @@ static void *legion_loop(void *foobar) {
 
 			d_len += d2_len;
 
-			if (d_len != uh->pktsize) {
+			if (d_len != uh->_pktsize) {
 				uwsgi_log("[uwsgi-legion] invalid packet size\n");
 				continue;
 			}
@@ -589,7 +587,7 @@ static void *legion_loop(void *foobar) {
 				continue;
 			}
 
-			// check for loop packets... (expecially when in multicast mode)
+			// check for loop packets... (especially when in multicast mode)
 			if (!uwsgi_strncmp(uwsgi.hostname, uwsgi.hostname_len, legion_msg.name, legion_msg.name_len)) {
 				if (legion_msg.pid == ul->pid) {
 					if (legion_msg.valor == ul->valor) {
@@ -1076,8 +1074,12 @@ struct uwsgi_legion *uwsgi_legion_register(char *legion, char *addr, char *valor
 		uwsgi_ssl_init();
 	}
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 	EVP_CIPHER_CTX *ctx = uwsgi_malloc(sizeof(EVP_CIPHER_CTX));
 	EVP_CIPHER_CTX_init(ctx);
+#else
+	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+#endif
 
 	const EVP_CIPHER *cipher = EVP_get_cipherbyname(algo);
 	if (!cipher) {
@@ -1111,8 +1113,12 @@ struct uwsgi_legion *uwsgi_legion_register(char *legion, char *addr, char *valor
 		exit(1);
 	}
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 	EVP_CIPHER_CTX *ctx2 = uwsgi_malloc(sizeof(EVP_CIPHER_CTX));
 	EVP_CIPHER_CTX_init(ctx2);
+#else
+	EVP_CIPHER_CTX *ctx2 = EVP_CIPHER_CTX_new();
+#endif
 
 	if (EVP_DecryptInit_ex(ctx2, cipher, NULL, (const unsigned char *) secret, (const unsigned char *) iv) <= 0) {
 		uwsgi_error("EVP_DecryptInit_ex()");
@@ -1213,7 +1219,8 @@ next:
 	}
 
 	// this must be called only by the master !!!
-	if (uwsgi.mywid > 0 || uwsgi.muleid > 0) return;
+	if (!uwsgi.workers) return;
+	if (uwsgi.workers[0].pid != getpid()) return;
 	uwsgi_legion_announce_death();
 }
 

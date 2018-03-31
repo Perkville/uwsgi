@@ -13,6 +13,7 @@ struct uwsgi_cgi {
 	struct uwsgi_string_list *allowed_ext;
 	struct uwsgi_string_list *unset;
 	struct uwsgi_string_list *loadlib;
+	struct uwsgi_string_list *cgi_safe;
 	int optimize;
 	int from_docroot;
 	int has_mountpoints;
@@ -20,6 +21,7 @@ struct uwsgi_cgi {
 	int path_info;
 	int do_not_kill_on_error;
 	int async_max_attempts;
+	int close_stdin_on_eof;
 } uc ;
 
 static void uwsgi_opt_add_cgi(char *opt, char *value, void *foobar) {
@@ -68,6 +70,10 @@ struct uwsgi_option uwsgi_cgi_options[] = {
 
         {"cgi-do-not-kill-on-error", no_argument, 0, "do not send SIGKILL to cgi script on errors", uwsgi_opt_true, &uc.do_not_kill_on_error, 0},
         {"cgi-async-max-attempts", no_argument, 0, "max waitpid() attempts in cgi async mode (default 10)", uwsgi_opt_set_int, &uc.async_max_attempts, 0},
+
+        {"cgi-close-stdin-on-eof", no_argument, 0, "close STDIN on input EOF", uwsgi_opt_true, &uc.close_stdin_on_eof, 0},
+
+        {"cgi-safe", required_argument, 0, "skip security checks if the cgi file is under the specified path", uwsgi_opt_add_string_list, &uc.cgi_safe, 0},
 
         {0, 0, 0, 0, 0, 0, 0},
 
@@ -351,7 +357,7 @@ send_body:
 
 static char *uwsgi_cgi_get_docroot(char *path_info, uint16_t path_info_len, int *need_free, int *is_a_file, int *discard_base, char **script_name) {
 
-	struct uwsgi_dyn_dict *udd = uc.mountpoint, *choosen_udd = NULL;
+	struct uwsgi_dyn_dict *udd = uc.mountpoint, *chosen_udd = NULL;
 	int best_found = 0;
 	struct stat st;
 	char *path = NULL;
@@ -361,7 +367,7 @@ static char *uwsgi_cgi_get_docroot(char *path_info, uint16_t path_info_len, int 
 			if (udd->vallen) {
 				if (!uwsgi_starts_with(path_info, path_info_len, udd->key, udd->keylen) && udd->keylen > best_found) {
 					best_found = udd->keylen ;
-					choosen_udd = udd;
+					chosen_udd = udd;
 					path = udd->value;
 					*script_name = udd->key;
 					*discard_base = udd->keylen;
@@ -374,13 +380,13 @@ static char *uwsgi_cgi_get_docroot(char *path_info, uint16_t path_info_len, int 
 		}
 	}
 
-	if (choosen_udd == NULL) {
-		choosen_udd = uc.default_cgi;
-		if (!choosen_udd) return NULL;
-		path = choosen_udd->key;
+	if (chosen_udd == NULL) {
+		chosen_udd = uc.default_cgi;
+		if (!chosen_udd) return NULL;
+		path = chosen_udd->key;
 	}
 
-	if (choosen_udd->status == 0) {
+	if (chosen_udd->status == 0) {
 		char *tmp_udd = uwsgi_malloc(PATH_MAX+1);
 		if (!realpath(path, tmp_udd)) {
 			free(tmp_udd);
@@ -401,7 +407,7 @@ static char *uwsgi_cgi_get_docroot(char *path_info, uint16_t path_info_len, int 
 		return tmp_udd;
 	}
 
-	if (choosen_udd->status == 2)
+	if (chosen_udd->status == 2)
 		*is_a_file = 1;
 	return path;
 }
@@ -480,7 +486,7 @@ static int uwsgi_cgi_request(struct wsgi_request *wsgi_req) {
 	char *script_name = NULL;
 
 	/* Standard CGI request */
-	if (!wsgi_req->uh->pktsize) {
+	if (!wsgi_req->len) {
 		uwsgi_log("Empty CGI request. skip.\n");
 		return -1;
 	}
@@ -532,12 +538,21 @@ static int uwsgi_cgi_request(struct wsgi_request *wsgi_req) {
 		// add +1 to copy the null byte
 		memcpy(full_path, tmp_path, full_path_len+1);
 
-		if (uwsgi_starts_with(full_path, full_path_len, docroot, docroot_len)) {
-			if (need_free)
-				free(docroot);
-                	uwsgi_log("CGI security error: %s is not under %s\n", full_path, docroot);
-                	return -1;
-        	}
+		struct uwsgi_string_list *safe = uc.cgi_safe;
+		while(safe) {
+			if (!uwsgi_starts_with(full_path, full_path_len, safe->value, safe->len))
+				break;
+			safe = safe->next;
+		}
+
+		if (!safe) {
+			if (uwsgi_starts_with(full_path, full_path_len, docroot, docroot_len)) {
+				uwsgi_log("CGI security error: %s is not under %s\n", full_path, docroot);
+				if (need_free)
+					free(docroot);
+				return -1;
+			}
+		}
 
 	}
 	else {
@@ -639,6 +654,7 @@ static int uwsgi_cgi_run(struct wsgi_request *wsgi_req, char *docroot, size_t do
 	char **argv;
 
 	char *command = full_path;
+	int stdin_closed = 0;
 
 	if (is_a_file) {
                 command = docroot;
@@ -691,6 +707,11 @@ static int uwsgi_cgi_run(struct wsgi_request *wsgi_req, char *docroot, size_t do
                 	remains -= rlen;
         	}
 
+		if (uc.close_stdin_on_eof) {
+			close(post_pipe[1]);
+			stdin_closed = 1;
+		}
+
 		// wait for data
 		char *buf = uwsgi_malloc(uc.buffer_size);
 
@@ -727,11 +748,12 @@ clear:
 		free(buf);
 clear2:
 		close(cgi_pipe[0]);
-		close(post_pipe[1]);
+		if (!stdin_closed)
+			close(post_pipe[1]);
 
 		// now wait for process exit/death
 		// in async mode we need a trick...
-		if (uwsgi.async > 1) {
+		if (uwsgi.async > 0) {
 			pid_t diedpid = waitpid(cgi_pid, &waitpid_status, WNOHANG);
 			if (diedpid < 0) {
                                	uwsgi_error("waitpid()");
@@ -763,12 +785,11 @@ clear2:
 	}
 
 	// fill cgi env
-	for(i=0;i<wsgi_req->var_cnt;i++) {
+	for(i=0;i<wsgi_req->var_cnt;i+=2) {
 		// no need to free the putenv() memory
 		if (putenv(uwsgi_concat3n(wsgi_req->hvec[i].iov_base, wsgi_req->hvec[i].iov_len, "=", 1, wsgi_req->hvec[i+1].iov_base, wsgi_req->hvec[i+1].iov_len))) {
 			uwsgi_error("putenv()");
 		}
-		i++;
 	}
 
 
