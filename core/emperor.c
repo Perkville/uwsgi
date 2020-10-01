@@ -918,7 +918,7 @@ void emperor_back_to_ondemand(struct uwsgi_instance *c_ui) {
 	// remove uWSGI instance
 
 	if (c_ui->pid != -1) {
-		if (write(c_ui->pipe[0], "\0", 1) != 1) {
+		if (write(c_ui->pipe[0], uwsgi.emperor_graceful_shutdown ? "\2" : "\0", 1) != 1) {
 			uwsgi_error("emperor_stop()/write()");
 		}
 	}
@@ -941,7 +941,7 @@ void emperor_stop(struct uwsgi_instance *c_ui) {
 	}
 
 	if (c_ui->pid != -1) {
-		if (write(c_ui->pipe[0], "\0", 1) != 1) {
+		if (write(c_ui->pipe[0], uwsgi.emperor_graceful_shutdown ? "\2" : "\0", 1) != 1) {
 			uwsgi_error("emperor_stop()/write()");
 		}
 	}
@@ -1193,7 +1193,7 @@ void emperor_add_with_attrs(struct uwsgi_emperor_scanner *ues, char *name, time_
 	}
 }
 
-static void uwsgi_emperor_spawn_vassal(struct uwsgi_instance *);
+static int uwsgi_emperor_spawn_vassal(struct uwsgi_instance *);
 
 static void vassal_fork_server_parser_hook(char *key, uint16_t key_len, char *value, uint16_t value_len, void *data) {
 	pid_t *pid = (pid_t *) data;
@@ -1472,7 +1472,7 @@ int uwsgi_emperor_vassal_start(struct uwsgi_instance *n_ui) {
 	return -1;
 }
 
-static void uwsgi_emperor_spawn_vassal(struct uwsgi_instance *n_ui) {
+static int uwsgi_emperor_spawn_vassal(struct uwsgi_instance *n_ui) {
 	int i;
 
 	// run plugin hooks for the vassal
@@ -1799,6 +1799,8 @@ static void uwsgi_emperor_spawn_vassal(struct uwsgi_instance *n_ui) {
         }
 	// never here
 	exit(UWSGI_EXILE_CODE);
+
+	return 0;
 }
 
 void uwsgi_imperial_monitor_glob_init(struct uwsgi_emperor_scanner *ues) {
@@ -2968,8 +2970,9 @@ void uwsgi_master_manage_emperor() {
 		if (byte == 0) {
 			uwsgi_hooks_run(uwsgi.hook_emperor_stop, "emperor-stop", 0);
 			close(uwsgi.emperor_fd);
-			if (!uwsgi.status.brutally_reloading)
+			if (!uwsgi.status.brutally_reloading && !uwsgi.status.brutally_destroying) {
 				kill_them_all(0);
+			}
 		}
 		// reload me
 		else if (byte == 1) {
@@ -2979,6 +2982,14 @@ void uwsgi_master_manage_emperor() {
 			uwsgi_block_signal(SIGHUP);
 			grace_them_all(0);
 			uwsgi_unblock_signal(SIGHUP);
+		}
+		// remove me gracefully
+		else if (byte == 2) {
+			uwsgi_hooks_run(uwsgi.hook_emperor_stop, "emperor-stop", 0);
+			close(uwsgi.emperor_fd);
+			if (!uwsgi.status.brutally_reloading && !uwsgi.status.brutally_destroying) {
+				gracefully_kill_them_all(0);
+			}
 		}
 	}
 #ifdef UWSGI_EVENT_USE_PORT

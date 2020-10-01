@@ -73,6 +73,8 @@ struct uwsgi_option http_options[] = {
 	{"http-manage-rtsp", no_argument, 0, "manage RTSP sessions", uwsgi_opt_true, &uhttp.manage_rtsp, 0},
 
 	{"http-post-buffering", required_argument, 0, "enable HTTP fastrouter post buffering", uwsgi_opt_set_64bit, &uhttp.cr.post_buffering, 0},
+        {"http-post-buffering-dir", required_argument, 0, "put fastrouter buffered files to the specified directory (noop, use TMPDIR env)", uwsgi_opt_set_str, &uhttp.cr.pb_base_dir, 0},
+
 	{0, 0, 0, 0, 0, 0, 0},
 };
 
@@ -1222,8 +1224,9 @@ ssize_t http_parse(struct corerouter_peer *main_peer) {
 			}
 
 			if (hr->remains > 0) {
-				if (hr->content_length < hr->remains) { 
-					hr->remains = hr->content_length;
+				if (hr->content_length < hr->remains) {
+					if (hr->content_length > 0 || !hr->raw_body)
+						hr->remains = hr->content_length;
 					hr->content_length = 0;
 					// we need to avoid problems with pipelined requests
 					hr->session.can_keepalive = 0;

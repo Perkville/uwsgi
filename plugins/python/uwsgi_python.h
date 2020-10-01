@@ -30,6 +30,14 @@
 #define HAS_NO_ERRORS_IN_PyFile_FromFd
 #endif
 
+#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION < 7
+#define HAS_NOT_PyOS_AfterFork_Child
+#endif
+
+#if PY_MAJOR_VERSION < 3
+#define HAS_NOT_PyOS_AfterFork_Child
+#endif
+
 #if PY_MAJOR_VERSION > 2
 #define PYTHREE
 #endif
@@ -222,6 +230,10 @@ struct uwsgi_python {
 	char *worker_override;
 
 	int wsgi_manage_chunked_input;
+
+	int master_check_signals;
+	
+	char *executable;
 };
 
 

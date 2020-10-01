@@ -205,6 +205,11 @@ struct uwsgi_option uwsgi_python_options[] = {
 
 	{"wsgi-manage-chunked-input", no_argument, 0, "manage chunked input via the wsgi.input_terminated extension", uwsgi_opt_true, &up.wsgi_manage_chunked_input, 0},
 
+	{"py-master-check-signals", no_argument, 0, "enable python signal handlers in master", uwsgi_opt_true, &up.master_check_signals, 0},
+
+	{"py-executable", required_argument, 0, "override sys.executable value", uwsgi_opt_set_str, &up.executable, 0},
+	{"py-sys-executable", required_argument, 0, "override sys.executable value", uwsgi_opt_set_str, &up.executable, 0},
+
 	{0, 0, 0, 0, 0, 0, 0},
 };
 
@@ -429,7 +434,11 @@ void uwsgi_python_post_fork() {
 
 	// reset python signal flags so child processes can trap signals
 	if (up.call_osafterfork) {
+#ifdef HAS_NOT_PyOS_AfterFork_Child
 		PyOS_AfterFork();
+#else
+                PyOS_AfterFork_Child();
+#endif
 	}
 
 	uwsgi_python_reset_random_seed();
@@ -810,8 +819,13 @@ void init_uwsgi_embedded_module() {
 
 	PyObject *py_opt_dict = PyDict_New();
 	for (i = 0; i < uwsgi.exported_opts_cnt; i++) {
-		if (PyDict_Contains(py_opt_dict, PyString_FromString(uwsgi.exported_opts[i]->key))) {
-			PyObject *py_opt_item = PyDict_GetItemString(py_opt_dict, uwsgi.exported_opts[i]->key);
+#ifdef PYTHREE
+		PyObject *key = PyUnicode_FromString(uwsgi.exported_opts[i]->key);
+#else
+		PyObject *key = PyString_FromString(uwsgi.exported_opts[i]->key);
+#endif
+		if (PyDict_Contains(py_opt_dict, key)) {
+			PyObject *py_opt_item = PyDict_GetItem(py_opt_dict, key);
 			if (PyList_Check(py_opt_item)) {
 				if (uwsgi.exported_opts[i]->value == NULL) {
 					PyList_Append(py_opt_item, Py_True);
@@ -830,15 +844,15 @@ void init_uwsgi_embedded_module() {
 					PyList_Append(py_opt_list, PyString_FromString(uwsgi.exported_opts[i]->value));
 				}
 
-				PyDict_SetItemString(py_opt_dict, uwsgi.exported_opts[i]->key, py_opt_list);
+				PyDict_SetItem(py_opt_dict, key, py_opt_list);
 			}
 		}
 		else {
 			if (uwsgi.exported_opts[i]->value == NULL) {
-				PyDict_SetItemString(py_opt_dict, uwsgi.exported_opts[i]->key, Py_True);
+				PyDict_SetItem(py_opt_dict, key, Py_True);
 			}
 			else {
-				PyDict_SetItemString(py_opt_dict, uwsgi.exported_opts[i]->key, PyString_FromString(uwsgi.exported_opts[i]->value));
+				PyDict_SetItem(py_opt_dict, key, PyString_FromString(uwsgi.exported_opts[i]->value));
 			}
 		}
 	}
@@ -1002,20 +1016,20 @@ int uwsgi_python_mount_app(char *mountpoint, char *app) {
 
 char *uwsgi_pythonize(char *orig) {
 
-	char *name = uwsgi_concat2(orig, "");
-	size_t i;
-	size_t len = 0;
+	char *name;
+	size_t i, len, offset = 0;
 
-	if (!strncmp(name, "sym://", 6)) {
-		name+=6;
+	if (!strncmp(orig, "sym://", 6)) {
+		offset = 6;
 	}
-	else if (!strncmp(name, "http://", 7)) {
-		name+=7;
+	else if (!strncmp(orig, "http://", 7)) {
+		offset = 7;
 	}
-	else if (!strncmp(name, "data://", 7)) {
-		name+=7;
+	else if (!strncmp(orig, "data://", 7)) {
+		offset = 7;
 	}
 
+	name = uwsgi_concat2(orig+offset, "");
 	len = strlen(name);
 	for(i=0;i<len;i++) {
 		if (name[i] == '.') {
@@ -1525,6 +1539,7 @@ void *uwsgi_python_autoreloader_thread(void *interpreter) {
 			if (!PyObject_HasAttrString(mod, "__file__")) continue;
 			PyObject *mod_file = PyObject_GetAttrString(mod, "__file__");
 			if (!mod_file) continue;
+			if (mod_file == Py_None) continue;
 #ifdef PYTHREE
 			PyObject *zero = PyUnicode_AsUTF8String(mod_file);
 			char *mod_filename = PyString_AsString(zero);
@@ -2034,7 +2049,11 @@ static int uwsgi_python_worker() {
 	UWSGI_GET_GIL;
 	// ensure signals can be used again from python
 	if (!up.call_osafterfork)
+#ifdef HAS_NOT_PyOS_AfterFork_Child
 		PyOS_AfterFork();
+#else
+                PyOS_AfterFork_Child();
+#endif
 	FILE *pyfile = fopen(up.worker_override, "r");
 	if (!pyfile) {
 		uwsgi_error_open(up.worker_override);
@@ -2043,6 +2062,23 @@ static int uwsgi_python_worker() {
 	PyRun_SimpleFile(pyfile, up.worker_override);
 	return 1;
 }
+
+static void uwsgi_python_master_cycle() {
+	if (up.master_check_signals) {
+                UWSGI_GET_GIL;
+
+                // run python signal handlers if any scheduled
+                if (PyErr_CheckSignals()) {
+			uwsgi_log("exception in python signal handler\n");
+			PyErr_Print();
+			UWSGI_RELEASE_GIL;
+			exit(1);
+		}
+
+		UWSGI_RELEASE_GIL;
+	}
+}
+
 
 struct uwsgi_plugin python_plugin = {
 	.name = "python",
@@ -2059,6 +2095,7 @@ struct uwsgi_plugin python_plugin = {
 
 	.fixup = uwsgi_python_fixup,
 	.master_fixup = uwsgi_python_master_fixup,
+	.master_cycle = uwsgi_python_master_cycle,
 
 	.mount_app = uwsgi_python_mount_app,
 

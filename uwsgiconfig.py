@@ -27,6 +27,10 @@ try:
 except ImportError:
     import configparser as ConfigParser
 
+try:
+    from shlex import quote
+except ImportError:
+    from pipes import quote
 
 PY3 = sys.version_info[0] == 3
 
@@ -216,11 +220,12 @@ int main()
 
 def spcall3(cmd):
     p = subprocess.Popen(cmd, shell=True, stdin=open('/dev/null'), stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+    (out, err) = p.communicate()
 
-    if p.wait() == 0:
+    if p.returncode == 0:
         if sys.version_info[0] > 2:
-            return p.stderr.read().rstrip().decode()
-        return p.stderr.read().rstrip()
+            return err.rstrip().decode()
+        return err.rstrip()
     else:
         return None
 
@@ -564,13 +569,19 @@ def build_uwsgi(uc, print_only=False, gcll=None):
             t.join()
 
     print("*** uWSGI linking ***")
-    ldline = "%s -o %s %s %s %s" % (
-        GCC,
-        bin_name,
-        ' '.join(uniq_warnings(ldflags)),
-        ' '.join(map(add_o, gcc_list)),
-        ' '.join(uniq_warnings(libs))
-    )
+    if '--static' in ldflags:
+        ldline = 'ar cru %s %s' % (
+            quote(bin_name),
+            ' '.join(map(add_o, gcc_list))
+        )
+    else:
+        ldline = "%s -o %s %s %s %s" % (
+            GCC,
+            quote(bin_name),
+            ' '.join(uniq_warnings(ldflags)),
+            ' '.join(map(add_o, gcc_list)),
+            ' '.join(uniq_warnings(libs))
+        )
     print(ldline)
     ret = os.system(ldline)
     if ret != 0:
@@ -634,7 +645,10 @@ class uConf(object):
         ulp.write(filename)
         ulp.close()
 
-        self.config.readfp(open_profile(filename))
+        if hasattr(self.config, 'read_file'):
+            self.config.read_file(open_profile(filename))
+        else:
+            self.config.readfp(open_profile(filename))
         self.gcc_list = [
             'core/utils', 'core/protocol', 'core/socket', 'core/logging',
             'core/master', 'core/master_utils', 'core/emperor', 'core/notify',
@@ -775,7 +789,10 @@ class uConf(object):
             for option in self.config.options('uwsgi'):
                 interpolations[option] = self.get(option, default='')
             iconfig = ConfigParser.ConfigParser(interpolations)
-            iconfig.readfp(open_profile(inherit))
+            if hasattr(self.config, 'read_file'):
+                iconfig.read_file(open_profile(inherit))
+            else:
+                iconfig.readfp(open_profile(inherit))
 
             for opt in iconfig.options('uwsgi'):
                 if not self.config.has_option('uwsgi', opt):
@@ -893,7 +910,12 @@ class uConf(object):
                 self.cflags.append('-DNO_SENDFILE')
                 self.cflags.append('-DNO_EXECINFO')
                 self.cflags.append('-DOLD_REALPATH')
-            self.cflags.append('-mmacosx-version-min=10.5')
+            darwin_major = int(uwsgi_os_k.split('.')[0])
+            # MacOS High Sierra and above: since XCode 10 there's no libgcc_s.10.5
+            if darwin_major >= 17:
+                self.cflags.append('-mmacosx-version-min=10.9')
+            else:
+                self.cflags.append('-mmacosx-version-min=10.5')
             if GCC in ('clang',):
                 self.libs.remove('-rdynamic')
 
@@ -1053,7 +1075,10 @@ class uConf(object):
         report['malloc'] = self.get('malloc_implementation')
 
         if self.get('as_shared_library'):
-            self.ldflags.append('-shared')
+            if self.get('as_shared_library') == 'static':
+                self.ldflags.append('--static')
+            else:
+                self.ldflags.append('-shared')
             # on cygwin we do not need PIC (it is implicit)
             if not uwsgi_os.startswith('CYGWIN'):
                 self.ldflags.append('-fPIC')
@@ -1115,7 +1140,7 @@ class uConf(object):
             self.libs.append('-lcap')
             report['capabilities'] = True
 
-        if self.has_include('uuid/uuid.h'):
+        if self.has_include('uuid/uuid.h') and not self.get('check'):
             self.cflags.append("-DUWSGI_UUID")
             if uwsgi_os in ('Linux', 'GNU', 'GNU/kFreeBSD') or uwsgi_os.startswith('CYGWIN') or os.path.exists('/usr/lib/libuuid.so') or os.path.exists('/usr/local/lib/libuuid.so') or os.path.exists('/usr/lib64/libuuid.so') or os.path.exists('/usr/local/lib64/libuuid.so'):
                 self.libs.append('-luuid')
@@ -1366,6 +1391,15 @@ def get_remote_plugin(path):
     return git_dir
 
 
+try:
+    execfile
+except NameError:
+    def execfile(path, up):
+        with open(path) as py:
+            code = __builtins__.compile(py.read(), path, 'exec')
+        exec(code, up)
+
+
 def get_plugin_up(path):
     up = {}
     if os.path.isfile(path):
@@ -1377,12 +1411,7 @@ def get_plugin_up(path):
         if not path:
             path = '.'
     elif os.path.isdir(path):
-        try:
-            execfile('%s/uwsgiplugin.py' % path, up)
-        except Exception:
-            f = open('%s/uwsgiplugin.py' % path)
-            exec(f.read(), up)
-            f.close()
+        execfile('%s/uwsgiplugin.py' % path, up)
     else:
         print("Error: unable to find directory '%s'" % path)
         sys.exit(1)

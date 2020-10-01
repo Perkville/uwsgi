@@ -340,10 +340,10 @@ def uwsgi_pypy_paste_loader(config):
     if c[0] != '/':
         c = os.getcwd() + '/' + c
     try:
-        from paste.script.util.logging_config import fileConfig
+        from logging.config import fileConfig
         fileConfig(c)
     except ImportError:
-        print("PyPy WARNING: unable to load paste.script.util.logging_config")
+        print("PyPy WARNING: unable to load logging.config")
     from paste.deploy import loadapp
     wsgi_application = loadapp('config:%s' % c)
 
@@ -381,6 +381,17 @@ class WSGIfilewrapper(object):
 
     def __iter__(self):
         return self
+
+    def __next__(self):
+        if self.chunksize:
+            data = self.f.read(self.chunksize)
+        else:
+            data = self.f.read()
+        if data:
+            return data
+        raise StopIteration()
+
+    next = __next__
 
     def sendfile(self):
         if hasattr(self.f, 'fileno'):

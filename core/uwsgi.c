@@ -182,7 +182,7 @@ static struct uwsgi_option uwsgi_base_options[] = {
 	{"connect-and-read", required_argument, 0, "connect to a socket and wait for data from it", uwsgi_opt_connect_and_read, NULL, UWSGI_OPT_IMMEDIATE},
 	{"extract", required_argument, 0, "fetch/dump any supported address to stdout", uwsgi_opt_extract, NULL, UWSGI_OPT_IMMEDIATE},
 
-	{"listen", required_argument, 'l', "set the socket listen queue size", uwsgi_opt_set_int, &uwsgi.listen_queue, 0},
+	{"listen", required_argument, 'l', "set the socket listen queue size", uwsgi_opt_set_int, &uwsgi.listen_queue, UWSGI_OPT_IMMEDIATE},
 	{"max-vars", required_argument, 'v', "set the amount of internal iovec/vars structures", uwsgi_opt_max_vars, NULL, 0},
 	{"max-apps", required_argument, 0, "set the maximum number of per-worker applications", uwsgi_opt_set_int, &uwsgi.max_apps, 0},
 	{"buffer-size", required_argument, 'b', "set internal buffer size", uwsgi_opt_set_64bit, &uwsgi.buffer_size, 0},
@@ -255,6 +255,7 @@ static struct uwsgi_option uwsgi_base_options[] = {
 	{"emperor-use-fork-server", required_argument, 0, "connect to the specified fork server instead of using plain fork() for new vassals", uwsgi_opt_set_str, &uwsgi.emperor_use_fork_server, 0},
 	{"vassal-fork-base", required_argument, 0, "use plain fork() for the specified vassal (instead of a fork-server)", uwsgi_opt_add_string_list, &uwsgi.vassal_fork_base, 0},
 	{"emperor-subreaper", no_argument, 0, "force the Emperor to be a sub-reaper (if supported)", uwsgi_opt_true, &uwsgi.emperor_subreaper, 0},
+	{"emperor-graceful-shutdown", no_argument, 0, "use vassals graceful shutdown during ragnarok", uwsgi_opt_true, &uwsgi.emperor_graceful_shutdown, 0},
 #ifdef UWSGI_CAP
 	{"emperor-cap", required_argument, 0, "set vassals capability", uwsgi_opt_set_emperor_cap, NULL, 0},
 	{"vassals-cap", required_argument, 0, "set vassals capability", uwsgi_opt_set_emperor_cap, NULL, 0},
@@ -299,6 +300,7 @@ static struct uwsgi_option uwsgi_base_options[] = {
 	{"max-requests-delta", required_argument, 0, "add (worker_id * delta) to the max_requests value of each worker", uwsgi_opt_set_64bit, &uwsgi.max_requests_delta, 0},
 	{"min-worker-lifetime", required_argument, 0, "number of seconds worker must run before being reloaded (default is 60)", uwsgi_opt_set_64bit, &uwsgi.min_worker_lifetime, 0},
 	{"max-worker-lifetime", required_argument, 0, "reload workers after the specified amount of seconds (default is disabled)", uwsgi_opt_set_64bit, &uwsgi.max_worker_lifetime, 0},
+	{"max-worker-lifetime-delta", required_argument, 0, "add (worker_id * delta) seconds to the max_worker_lifetime value of each worker", uwsgi_opt_set_int, &uwsgi.max_worker_lifetime_delta, 0},
 
 	{"socket-timeout", required_argument, 'z', "set internal sockets timeout", uwsgi_opt_set_int, &uwsgi.socket_timeout, 0},
 	{"no-fd-passing", no_argument, 0, "disable file descriptor passing", uwsgi_opt_true, &uwsgi.no_fd_passing, 0},
@@ -716,7 +718,9 @@ static struct uwsgi_option uwsgi_base_options[] = {
 	{"sni-dir", required_argument, 0, "check for cert/key/client_ca file in the specified directory and create a sni/ssl context on demand", uwsgi_opt_set_str, &uwsgi.sni_dir, 0},
 	{"sni-dir-ciphers", required_argument, 0, "set ssl ciphers for sni-dir option", uwsgi_opt_set_str, &uwsgi.sni_dir_ciphers, 0},
 	{"ssl-enable3", no_argument, 0, "enable SSLv3 (insecure)", uwsgi_opt_true, &uwsgi.sslv3, 0},
-	{"ssl-option", no_argument, 0, "set a raw ssl option (numeric value)", uwsgi_opt_add_string_list, &uwsgi.ssl_options, 0},
+	{"ssl-enable-sslv3", no_argument, 0, "enable SSLv3 (insecure)", uwsgi_opt_true, &uwsgi.sslv3, 0},
+	{"ssl-enable-tlsv1", no_argument, 0, "enable TLSv1 (insecure)", uwsgi_opt_true, &uwsgi.tlsv1, 0},
+	{"ssl-option", required_argument, 0, "set a raw ssl option (numeric value)", uwsgi_opt_add_string_list, &uwsgi.ssl_options, 0},
 #ifdef UWSGI_PCRE
 	{"sni-regexp", required_argument, 0, "add an SNI-governed SSL context (the key is a regexp)", uwsgi_opt_sni, NULL, 0},
 #endif
@@ -771,7 +775,7 @@ static struct uwsgi_option uwsgi_base_options[] = {
 	{"alarm", required_argument, 0, "create a new alarm, syntax: <alarm> <plugin:args>", uwsgi_opt_add_string_list, &uwsgi.alarm_list, UWSGI_OPT_MASTER},
 	{"alarm-cheap", required_argument, 0, "use main alarm thread rather than create dedicated threads for curl-based alarms", uwsgi_opt_true, &uwsgi.alarm_cheap, 0},
 	{"alarm-freq", required_argument, 0, "tune the anti-loop alarm system (default 3 seconds)", uwsgi_opt_set_int, &uwsgi.alarm_freq, 0},
-	{"alarm-fd", required_argument, 0, "raise the specified alarm when an fd is read for read (by default it reads 1 byte, set 8 for eventfd)", uwsgi_opt_add_string_list, &uwsgi.alarm_fd_list, UWSGI_OPT_MASTER},
+	{"alarm-fd", required_argument, 0, "raise the specified alarm when an fd is ready for read (by default it reads 1 byte, set 8 for eventfd)", uwsgi_opt_add_string_list, &uwsgi.alarm_fd_list, UWSGI_OPT_MASTER},
 	{"alarm-segfault", required_argument, 0, "raise the specified alarm when the segmentation fault handler is executed", uwsgi_opt_add_string_list, &uwsgi.alarm_segfault, UWSGI_OPT_MASTER},
 	{"segfault-alarm", required_argument, 0, "raise the specified alarm when the segmentation fault handler is executed", uwsgi_opt_add_string_list, &uwsgi.alarm_segfault, UWSGI_OPT_MASTER},
 	{"alarm-backlog", required_argument, 0, "raise the specified alarm when the socket backlog queue is full", uwsgi_opt_add_string_list, &uwsgi.alarm_backlog, UWSGI_OPT_MASTER},
@@ -1513,7 +1517,7 @@ void reap_them_all(int signum) {
 
 void harakiri() {
 
-	uwsgi_log("\nF*CK !!! i must kill myself (pid: %d app_id: %d)...\n", uwsgi.mypid, uwsgi.wsgi_req->app_id);
+	uwsgi_log("\nKilling the current process (pid: %d app_id: %d)...\n", uwsgi.mypid, uwsgi.wsgi_req->app_id);
 
 	if (!uwsgi.master_process) {
 		uwsgi_log("*** if you want your workers to be automatically respawned consider enabling the uWSGI master process ***\n");
@@ -1887,7 +1891,7 @@ void uwsgi_plugins_atexit(void) {
 
 void uwsgi_backtrace(int depth) {
 
-#if defined(__GLIBC__) || (defined(__APPLE__) && !defined(NO_EXECINFO)) || defined(UWSGI_HAS_EXECINFO)
+#if (!defined(__UCLIBC__) && defined(__GLIBC__)) || (defined(__APPLE__) && !defined(NO_EXECINFO)) || defined(UWSGI_HAS_EXECINFO)
 
 #include <execinfo.h>
 
@@ -2174,8 +2178,6 @@ void uwsgi_setup(int argc, char *argv[], char *envp[]) {
 	atexit(vacuum);
 	// call user scripts
 	atexit(uwsgi_exec_atexit);
-	// call plugin specific exit hooks
-	atexit(uwsgi_plugins_atexit);
 #ifdef UWSGI_SSL
 	// call legions death hooks
 	atexit(uwsgi_legion_atexit);
@@ -2323,7 +2325,7 @@ configure:
 	uwsgi_commandline_config();
 
 	// second pass: ENVs
-	uwsgi_apply_config_pass('$', (char *(*)(char *)) getenv);
+	uwsgi_apply_config_pass('$', (char *(*)(char *)) uwsgi_getenv_with_default);
 
 	// third pass: FILEs
 	uwsgi_apply_config_pass('@', uwsgi_at_file_read);
@@ -3192,10 +3194,6 @@ unsafe:
 	if (uwsgi.logformat) {
 		uwsgi_build_log_format(uwsgi.logformat);
 		uwsgi.logit = uwsgi_logit_lf;
-		// TODO check it
-		//if (uwsgi.logformat_strftime) {
-			//uwsgi.logit = uwsgi_logit_lf_strftime;
-		//}
 		uwsgi.logvectors = uwsgi_malloc(sizeof(struct iovec *) * uwsgi.cores);
 		for (j = 0; j < uwsgi.cores; j++) {
 			uwsgi.logvectors[j] = uwsgi_malloc(sizeof(struct iovec) * uwsgi.logformat_vectors);
@@ -3236,6 +3234,11 @@ next:
 	if (!uwsgi.lazy && !uwsgi.lazy_apps) {
 		uwsgi_init_all_apps();
 	}
+
+	// Register uwsgi atexit plugin callbacks after all applications have
+	// been loaded. This ensures plugin atexit callbacks are called prior
+	// to application registered atexit callbacks.
+	atexit(uwsgi_plugins_atexit);
 
 	if (!uwsgi.master_as_root) {
 		uwsgi_log("dropping root privileges after application loading\n");
@@ -4133,7 +4136,11 @@ void uwsgi_opt_safe_fd(char *opt, char *value, void *foobar) {
 void uwsgi_opt_set_int(char *opt, char *value, void *key) {
 	int *ptr = (int *) key;
 	if (value) {
-		*ptr = atoi((char *) value);
+		char *endptr;
+		*ptr = (int)strtol(value, &endptr, 10);
+		if (*endptr) {
+			uwsgi_log("[WARNING] non-numeric value \"%s\" for option \"%s\" - using %d !\n", value, opt, *ptr);
+		}
 	}
 	else {
 		*ptr = 1;
